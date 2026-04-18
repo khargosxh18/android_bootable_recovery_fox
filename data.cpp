@@ -1101,7 +1101,8 @@ void DataManager::SetDefaultValues()
 		mData.SetValue(TW_IS_SUPER, "0");
 		mData.SetValue(TW_FASTBOOT_MODE, "0");
 		mData.SetValue("fox_dynamic_device", "0");
-		TWFunc::Fox_Property_Set("ro.fastbootd.available", "0");
+		if (TWFunc::Fox_Property_Get("ro.fastbootd.available").empty())
+			TWFunc::Fox_Property_Set("ro.fastbootd.available", "0");
 		TWFunc::Fox_Property_Set("orangefox.super.partition", "false");
 	}
 	else {
@@ -1111,10 +1112,12 @@ void DataManager::SetDefaultValues()
 		#ifdef OF_NO_REBOOT_FASTBOOT
 		printf("OF_NO_REBOOT_FASTBOOT := 1\n");
 		mData.SetValue(TW_FASTBOOT_MODE, "0");
-		TWFunc::Fox_Property_Set("ro.fastbootd.available", "0");
+		if (TWFunc::Fox_Property_Get("ro.fastbootd.available").empty())
+			TWFunc::Fox_Property_Set("ro.fastbootd.available", "0");
 		#else
 		mData.SetValue(TW_FASTBOOT_MODE, "1");
-		TWFunc::Fox_Property_Set("ro.fastbootd.available", "1");
+		if (TWFunc::Fox_Property_Get("ro.fastbootd.available").empty())
+			TWFunc::Fox_Property_Set("ro.fastbootd.available", "1");
 		#endif
 	}
 #else
