@@ -868,7 +868,7 @@
 
 			<text style="text_ab_switch_off">
 				<condition var1="fox_adb" op="!=" var2="1"/>
-				<placement x="%gl_text_x%" y="%ab_bc2_y%"/>
+				<placement x="%switch_text_x%" y="%ab_bc2_y%"/>
 				<text>ADB</text>
 			</text>
 
