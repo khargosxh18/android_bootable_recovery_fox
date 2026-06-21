@@ -370,5 +370,6 @@
 			<font resource="status" color="%text_status%" colorLow="#FFA244" padding="10"/>
 			<charging img="bolt" x="-20" y="5"/>
 		</style>
+
 	</styles>
 </recovery>

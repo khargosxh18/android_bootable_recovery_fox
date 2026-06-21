@@ -2,7 +2,7 @@
 	Copyright 2012-2020 TeamWin
 	This file is part of TWRP/TeamWin Recovery Project.
 
-	Copyright (C) 2018-2026 OrangeFox Recovery Project
+	Copyright (C) 2018-2025 OrangeFox Recovery Project
 	This file is part of the OrangeFox Recovery Project.
 
 	TWRP is free software: you can redistribute it and/or modify
@@ -256,7 +256,7 @@ static void process_recovery_mode(twrpAdbBuFifo* adb_bu_fifo, bool skip_decrypti
 	// Check for and load custom theme if present
 	TWFunc::check_selinux_support();
 	gui_loadCustomResources();
-#ifdef FOX_ALLOW_EARLY_SETTINGS_LOAD
+#ifdef OF_ALLOW_EARLY_SETTINGS_LOAD
 	// Reset Mount_Read_Only flag here to follow tw_mount_system_ro var
 	if (PartitionManager.Get_Super_Status())
 		PartitionManager.Mount_Super_Toggle(DataManager::GetStrValue("tw_mount_system_ro"));
@@ -268,7 +268,7 @@ static void process_recovery_mode(twrpAdbBuFifo* adb_bu_fifo, bool skip_decrypti
 		TWFunc::Fixup_Time_On_Boot();
 
 	TWFunc::Update_Log_File();
-#ifndef FOX_ALLOW_EARLY_SETTINGS_LOAD
+#ifndef OF_ALLOW_EARLY_SETTINGS_LOAD
 	DataManager::ReadSettingsFile();
 #endif
 
@@ -327,7 +327,7 @@ static void process_recovery_mode(twrpAdbBuFifo* adb_bu_fifo, bool skip_decrypti
 				if (!created)
 					LOGERR("Unable to create log directory for TWRP\n");
 			}
-#ifndef FOX_ALLOW_EARLY_SETTINGS_LOAD
+#ifndef OF_ALLOW_EARLY_SETTINGS_LOAD
 			DataManager::ReadSettingsFile();
 			PartitionManager.Mount_Super_Toggle(DataManager::GetStrValue("tw_mount_system_ro"));
 #endif
@@ -403,7 +403,7 @@ static bool Fox_CheckReload_Themes() {
   || TWFunc::Fox_Property_Get("orangefox.mount_to_decrypt") == "1") {
 	DataManager::SetValue(FOX_ENCRYPTED_DEVICE, "1");
     }
-#if defined(FOX_ALLOW_EARLY_SETTINGS_LOAD) && defined(FOX_SETTINGS_ROOT_DIRECTORY)
+#if defined(OF_ALLOW_EARLY_SETTINGS_LOAD) && defined(OF_SETTINGS_ROOT_DIRECTORY)
   return false;
 #else
   return (TWFunc::Path_Exists(FOX_THEME_PATH) || TWFunc::Path_Exists(FOX_NAVBAR_PATH));
@@ -630,7 +630,7 @@ int main(int argc, char **argv) {
 	} else {
 		process_recovery_mode(adb_bu_fifo, startup.Should_Skip_Decryption());
 	}
-#ifndef FOX_ALLOW_EARLY_SETTINGS_LOAD
+#ifndef OF_ALLOW_EARLY_SETTINGS_LOAD
 	// Language
 	PageManager::LoadLanguage(DataManager::GetStrValue("tw_language"));
 	GUIConsole::Translate_Now();

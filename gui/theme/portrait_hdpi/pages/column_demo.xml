@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<!--
+	Prototype demo for the <column>/<row> auto-placement containers.
+	Navigate here with:  <action function="page">column_demo</action>
+	(or `twrp set` the current page from adb). None of the children below
+	carry an x/y - the container assigns positions along its axis.
+-->
+<recovery>
+	<pages>
+		<page name="column_demo">
+			<template name="base"/>
+
+			<text style="text_ab_title">
+				<placement x="%col1_x_indent%" y="%ab_bc_y%"/>
+				<text>column / row auto-placement</text>
+			</text>
+
+			<!-- Vertical stack: each text is placed under the previous one.
+			     itemheight is the fallback advance for un-bounded text. -->
+			<column x="%col1_x_indent%" y="%row1_1_y%" spacing="14" itemheight="48">
+				<text style="caption"><text>First row (auto-placed)</text></text>
+				<text style="caption"><text>Second row</text></text>
+				<text style="caption"><text>Third row</text></text>
+				<text style="caption"><text>Fourth row</text></text>
+			</column>
+
+			<!-- Horizontal stack: three labels flow left-to-right. -->
+			<row x="%col1_x_indent%" y="%row6_1_y%" spacing="40" itemwidth="120">
+				<text style="caption"><text>Left</text></text>
+				<text style="caption"><text>Mid</text></text>
+				<text style="caption"><text>Right</text></text>
+			</row>
+		</page>
+	</pages>
+</recovery>

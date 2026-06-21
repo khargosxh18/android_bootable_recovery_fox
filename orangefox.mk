@@ -20,6 +20,16 @@
 
 LOCAL_CFLAGS += -Wno-unused-parameter -Wno-unused-function -Wno-unused-variable
 
+# libvterm backs the in-UI terminal (gui/terminal.cpp) and is ALWAYS required.
+# It is built from sources (external/libvterm, Soong cc_library_static "libvterm");
+# the pre-generated encoding tables ship in-tree so no codegen step is needed.
+ifeq ($(wildcard external/libvterm/Android.bp),)
+    $(warning libvterm sources not found! You need to clone the sources.)
+    $(warning Please run: "git clone --depth=1 https://github.com/neovim/libvterm -b master external/libvterm")
+    $(warning (then add external/libvterm/Android.bp from the OrangeFox tree if your clone lacks it))
+    $(error libvterm sources not present; exiting.)
+endif
+
 # Canonical release version
 FOX_INTERNAL_RELEASE := R12.0
 LOCAL_CFLAGS += -DFOX_INTERNAL_RELEASE='"$(FOX_INTERNAL_RELEASE)"'
@@ -324,8 +334,8 @@ ifeq ($(OF_ENABLE_LAB),1)
     LOCAL_CFLAGS += -DOF_ENABLE_LAB='"1"'
 endif
 
-ifeq ($(FOX_USE_NANO_EDITOR), 1)
-    LOCAL_CFLAGS += -DFOX_USE_NANO_EDITOR='"1"'
+ifeq ($(OF_USE_NANO_EDITOR), 1)
+    LOCAL_CFLAGS += -DOF_USE_NANO_EDITOR='"1"'
 endif
 
 ifeq ($(OF_NO_MIUI_OTA_VENDOR_BACKUP),1)
@@ -417,7 +427,7 @@ ifeq ($(FOX_EXCLUDE_NANO_EDITOR),1)
     TW_EXCLUDE_NANO := true
 endif
 
-ifeq ($(FOX_USE_NANO_EDITOR),1)
+ifeq ($(OF_USE_NANO_EDITOR),1)
     TW_EXCLUDE_NANO := true
 endif
 
@@ -662,37 +672,37 @@ ifeq ($(OF_SUPPORT_VBMETA_AVB2_PATCHING),1)
 endif
 
 # custom settings directory
-ifeq ($(FOX_USE_DATA_RECOVERY_FOR_SETTINGS),1)
-    ifneq ($(FOX_SETTINGS_ROOT_DIRECTORY),)
-       $(error You cannot use "FOX_SETTINGS_ROOT_DIRECTORY" with "FOX_USE_DATA_RECOVERY_FOR_SETTINGS")
+ifeq ($(OF_USE_DATA_RECOVERY_FOR_SETTINGS),1)
+    ifneq ($(OF_SETTINGS_ROOT_DIRECTORY),)
+       $(error You cannot use "OF_SETTINGS_ROOT_DIRECTORY" with "OF_USE_DATA_RECOVERY_FOR_SETTINGS")
     endif
-    ifneq ($(FOX_MISCELLANEOUS_ROOT_DIRECTORY),)
-       $(error You cannot use "FOX_MISCELLANEOUS_ROOT_DIRECTORY" with "FOX_USE_DATA_RECOVERY_FOR_SETTINGS")
+    ifneq ($(OF_MISCELLANEOUS_ROOT_DIRECTORY),)
+       $(error You cannot use "OF_MISCELLANEOUS_ROOT_DIRECTORY" with "OF_USE_DATA_RECOVERY_FOR_SETTINGS")
     endif
-    LOCAL_CFLAGS += -DFOX_SETTINGS_ROOT_DIRECTORY='"/data/recovery"'
-    LOCAL_CFLAGS += -DFOX_MISCELLANEOUS_ROOT_DIRECTORY='"/data/recovery"'
-    LOCAL_CFLAGS += -DFOX_USE_DATA_RECOVERY_FOR_SETTINGS
+    LOCAL_CFLAGS += -DOF_SETTINGS_ROOT_DIRECTORY='"/data/recovery"'
+    LOCAL_CFLAGS += -DOF_MISCELLANEOUS_ROOT_DIRECTORY='"/data/recovery"'
+    LOCAL_CFLAGS += -DOF_USE_DATA_RECOVERY_FOR_SETTINGS
 endif
 
-ifneq ($(FOX_SETTINGS_ROOT_DIRECTORY),)
-    ifeq ($(FOX_MISCELLANEOUS_ROOT_DIRECTORY),)
-       LOCAL_CFLAGS += -DFOX_MISCELLANEOUS_ROOT_DIRECTORY='"$(FOX_SETTINGS_ROOT_DIRECTORY)"'
+ifneq ($(OF_SETTINGS_ROOT_DIRECTORY),)
+    ifeq ($(OF_MISCELLANEOUS_ROOT_DIRECTORY),)
+       LOCAL_CFLAGS += -DOF_MISCELLANEOUS_ROOT_DIRECTORY='"$(OF_SETTINGS_ROOT_DIRECTORY)"'
     endif
-    LOCAL_CFLAGS += -DFOX_SETTINGS_ROOT_DIRECTORY='"$(FOX_SETTINGS_ROOT_DIRECTORY)"'
+    LOCAL_CFLAGS += -DOF_SETTINGS_ROOT_DIRECTORY='"$(OF_SETTINGS_ROOT_DIRECTORY)"'
 endif
 
-ifneq ($(FOX_MISCELLANEOUS_ROOT_DIRECTORY),)
-    ifneq ($(FOX_USE_DATA_RECOVERY_FOR_SETTINGS),1)
-        $(warning "FOX_MISCELLANEOUS_ROOT_DIRECTORY" is used. This is EXPERIMENTAL. Ensure that "$(FOX_MISCELLANEOUS_ROOT_DIRECTORY)" will ALWAYS be accessible on the device)
+ifneq ($(OF_MISCELLANEOUS_ROOT_DIRECTORY),)
+    ifneq ($(OF_USE_DATA_RECOVERY_FOR_SETTINGS),1)
+        $(warning "OF_MISCELLANEOUS_ROOT_DIRECTORY" is used. This is EXPERIMENTAL. Ensure that "$(OF_MISCELLANEOUS_ROOT_DIRECTORY)" will ALWAYS be accessible on the device)
     endif
-    LOCAL_CFLAGS += -DFOX_MISCELLANEOUS_ROOT_DIRECTORY='"$(FOX_MISCELLANEOUS_ROOT_DIRECTORY)"'
+    LOCAL_CFLAGS += -DOF_MISCELLANEOUS_ROOT_DIRECTORY='"$(OF_MISCELLANEOUS_ROOT_DIRECTORY)"'
 endif
 
-ifeq ($(FOX_ALLOW_EARLY_SETTINGS_LOAD),1)
-    #ifeq ($(FOX_SETTINGS_ROOT_DIRECTORY),)
-    #   $(error You cannot use "FOX_ALLOW_EARLY_SETTINGS_LOAD" without "FOX_SETTINGS_ROOT_DIRECTORY")
+ifeq ($(OF_ALLOW_EARLY_SETTINGS_LOAD),1)
+    #ifeq ($(OF_SETTINGS_ROOT_DIRECTORY),)
+    #   $(error You cannot use "OF_ALLOW_EARLY_SETTINGS_LOAD" without "OF_SETTINGS_ROOT_DIRECTORY")
     #endif
-    LOCAL_CFLAGS += -DFOX_ALLOW_EARLY_SETTINGS_LOAD='"1"'
+    LOCAL_CFLAGS += -DOF_ALLOW_EARLY_SETTINGS_LOAD='"1"'
 endif
 
 # whether to wipe /metadata after formatting data

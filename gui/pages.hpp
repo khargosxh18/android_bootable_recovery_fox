@@ -27,6 +27,7 @@
 #include <vector>
 #include <map>
 #include <string>
+#include <functional>
 #include "ziparchive/zip_archive.h"
 #include "rapidxml.hpp"
 #include "gui.hpp"
@@ -65,6 +66,16 @@ extern std::vector<language_struct> Language_List;
 // Utility Functions
 int ConvertStrToColor(std::string str, COLOR* color);
 int gui_forceRender(void);
+
+// Show a transient toast/snackbar overlay with `text` for `frames` GUI frames
+// (~30/sec), auto-dismissing. Requires a <page name="toast"> in the theme.
+void gui_toast(const std::string& text, int frames);
+
+// Marshal a callable onto the GUI thread: it runs at the top of the next
+// PageManager::Update(), so the body may safely touch PageManager/page state.
+// Safe to call from any thread. Fire-and-forget.
+void gui_run_on_main(std::function<void()> fn);
+
 int gui_changePage(std::string newPage);
 int gui_changeOverlay(std::string newPage);
 
@@ -126,6 +137,22 @@ protected:
 
 protected:
 	bool ProcessNode(xml_node<>* page, std::vector<xml_node<>*> *templates, int depth);
+
+	// LayoutContainer - auto-place the objects added to mObjects from index
+	// firstObject..end along one axis (vertical for <column>, horizontal for
+	// <row>), starting at (originX, originY) with `spacing` px between items.
+	// `defaultItemSize` is the fallback main-axis advance for objects that do
+	// not report an intrinsic size (e.g. bounded-less text).
+	//   crossExtent - cross-axis size of the container (0 = unknown, no align)
+	//   align       - cross-axis alignment: 0=start, 1=center, 2=end
+	//   mainExtent  - main-axis size for weight distribution (0 = none)
+	//   weights     - per-renderable-child weight (main-axis flex), 1:1 with the
+	//                 renderable children in order; empty / size-mismatch = off.
+	// See ProcessNode.
+	void LayoutContainer(size_t firstObject, int originX, int originY,
+			int spacing, bool horizontal, int defaultItemSize,
+			int crossExtent, int align, int mainExtent,
+			const std::vector<int>& weights);
 };
 
 struct LoadingContext;
@@ -203,6 +230,8 @@ public:
 	// These are routing routines
 	static int Render(void);
 	static int Update(void);
+	// Drains the gui_run_on_main() queue; called at the top of Update().
+	static void RunDeferredActions(void);
 	static int NotifyTouch(TOUCH_STATE state, int x, int y);
 	static int NotifyKey(int key, bool down);
 	static int NotifyCharInput(int ch);

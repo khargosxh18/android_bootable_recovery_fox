@@ -562,5 +562,49 @@
 				<action function="overlay"/>
 			</action>
 		</page>
+
+		<!-- FoxUiEngine transient toast/snackbar overlay. Shown by
+		     <action function="toast">message</action>; auto-dismisses (~3s) and
+		     can be tapped to dismiss early. Message lives in %toast_text%. -->
+		<page name="toast">
+			<!-- Full-width snackbar: the <card> spans %toast_w% (almost the whole
+			     screen), auto-grows in height for 1 or 2-line text, and slides up
+			     into place (intro) just above the nav panel. No fixed x/y geometry.
+			     The outline colour + icon follow the bootstrap-style severity set
+			     by gui_toast() ([success]/[warning]/[info]/[error]); the icon is
+			     picked by a condition on %toast_type%, the outline by %toast_outline%. -->
+			<card direction="horizontal" align="center"
+			      padding="%space_m%" spacing="%space_s%"
+			      radius="36" outlinewidth="4"
+			      color="%cards_bg%" outline="%toast_c_info%" outlinevar="toast_outline"
+			      centerx="1" bottom="%toast_bottom%" width="%toast_w%" intro="1">
+				<image>
+					<conditions><condition var1="toast_type" var2="success"/></conditions>
+					<image resource="toast_ic_success"/>
+				</image>
+				<image>
+					<conditions><condition var1="toast_type" var2="warning"/></conditions>
+					<image resource="toast_ic_warning"/>
+				</image>
+				<image>
+					<conditions><condition var1="toast_type" var2="error"/></conditions>
+					<image resource="toast_ic_error"/>
+				</image>
+				<image>
+					<conditions><condition var1="toast_type" var2="info"/></conditions>
+					<image resource="toast_ic_info"/>
+				</image>
+				<text style="caption">
+					<text>%toast_text%</text>
+				</text>
+			</card>
+
+			<!-- tap anywhere (incl. the pill) to dismiss early; on top so it wins touches -->
+			<button>
+				<placement x="0" y="0" w="%screen_w%" h="%screen_h%"/>
+				<fill color="%transparent%"/>
+				<action function="overlay"/>
+			</button>
+		</page>
 	</pages>
 </recovery>

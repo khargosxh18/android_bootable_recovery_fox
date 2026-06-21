@@ -20,6 +20,8 @@
 */
 
 #include <string.h>
+#include <math.h>
+#include <algorithm>
 
 extern "C" {
 #include "../twcommon.h"
@@ -33,6 +35,12 @@ extern "C" {
 
 const float SCROLLING_SPEED_DECREMENT = 0.9; // friction
 const int SCROLLING_FLOOR = 2; // minimum pixels for scrolling to stop
+
+// Spring/rubber-band overscroll tuning.
+const float OVERSCROLL_RESIST = 0.50f;     // base drag follow ratio at the edge (rubber-band)
+const float OVERSCROLL_SPRINGBACK = 0.60f; // per-frame decay of overscroll toward 0 on release
+const float OVERSCROLL_FLING = 0.25f;      // fraction of fling speed converted to an edge bounce
+const float OVERSCROLL_MAX_ITEMS = 2.0f;   // cap the stretch at ~this many item-heights
 
 GUIScrollList::GUIScrollList(xml_node<>* node) : GUIObject(node)
 {
@@ -50,6 +58,8 @@ GUIScrollList::GUIScrollList(xml_node<>* node) : GUIObject(node)
 	mFastScrollRectCurrentY = mFastScrollRectCurrentH = mFastScrollRectTouchY = 0;
 	lastY = last2Y = fastScroll = 0;
 	mUpdate = 0;
+	mOverScroll = 0.0f;
+	mDragActive = false;
 	touchDebounce = 6;
 	ConvertStrToColor("black", &mBackgroundColor);
 	ConvertStrToColor("black", &mHeaderBackgroundColor);
@@ -221,6 +231,7 @@ void GUIScrollList::SetVisibleListLocation(size_t list_index)
 			firstDisplayedItem = 0;
 	}
 	scrollingSpeed = 0; // stop kinetic scrolling on setting visible location
+	mOverScroll = 0.0f; // and drop any rubber-band stretch
 	mUpdate = 1;
 }
 
@@ -260,6 +271,7 @@ int GUIScrollList::Render(void)
 	if (totalHeight <= windowH) {
 		hasScroll = false;
 		scrollingSpeed = 0;
+		mOverScroll = 0.0f; // a list that fits never rubber-bands
 		lines = listSize;
 		y_offset = 0;
 		listW = mRenderW;
@@ -272,7 +284,10 @@ int GUIScrollList::Render(void)
 			lines = listSize - firstDisplayedItem;
 	}
 
-	int yPos = mRenderY + mHeaderH + y_offset;
+	// Shift the whole list by the rubber-band overscroll offset. The existing
+	// gr_clip above confines drawing to the list box, so the stretched edge just
+	// reveals the list background (the modern "pull past the end" look).
+	int yPos = mRenderY + mHeaderH + y_offset + (int)mOverScroll;
 
 	// render all visible items
 	for (size_t line = 0; line < lines; line++)
@@ -528,6 +543,15 @@ int GUIScrollList::Update(void)
 		}
 	}
 
+	// Spring the rubber-band overscroll back to rest once the finger is up and
+	// no fling is in progress (a settling fling-bounce decays the same way).
+	if (!mDragActive && mOverScroll != 0.0f && scrollingSpeed == 0) {
+		mOverScroll *= OVERSCROLL_SPRINGBACK;
+		if (fabsf(mOverScroll) < 1.0f)
+			mOverScroll = 0.0f;
+		mUpdate = 1;
+	}
+
 	// Handle kinetic scrolling
 	// maximum number of items to scroll per update
 	float maxItemsScrolledPerFrame = std::max(2.5, float(GetDisplayItemCount() / 4) + 0.5);
@@ -535,8 +559,9 @@ int GUIScrollList::Update(void)
 	int maxScrollDistance = actualItemHeight * maxItemsScrolledPerFrame;
 	int oldScrollingSpeed = scrollingSpeed;
 	if (scrollingSpeed == 0) {
-		// Do nothing
-		return 0;
+		// Nothing kinetic - keep driving frames while a released spring settles
+		// (during an active drag the touch events already drive rendering).
+		return (!mDragActive && mOverScroll != 0.0f) ? 2 : 0;
 	} else if (scrollingSpeed > 0) {
 		if (scrollingSpeed < maxScrollDistance)
 			y_offset += scrollingSpeed;
@@ -559,7 +584,8 @@ int GUIScrollList::Update(void)
 	HandleScrolling();
 	mUpdate = 1;
 
-	return 0;
+	// A fling (and any bounce it spawned) is animating - keep frames flowing.
+	return 2;
 }
 
 size_t GUIScrollList::HitTestItem(int x __unused, int y)
@@ -597,6 +623,7 @@ int GUIScrollList::NotifyTouch(TOUCH_STATE state, int x, int y)
 	switch (state)
 	{
 	case TOUCH_START:
+		mDragActive = true; // finger is down: drags rubber-band instead of springing back
 		if (hasScroll && x >= mRenderX + mRenderW - mFastScrollW) {
 			fastScroll = 1; // Initial touch is in the fast scroll region
 			int fastScrollBoxTop = mFastScrollRectCurrentY + mRenderY + mHeaderH;
@@ -658,11 +685,35 @@ int GUIScrollList::NotifyTouch(TOUCH_STATE state, int x, int y)
 		selectedItem = NO_ITEM; // nothing is selected because we dragged too far
 		// Handle scrolling
 		if (hasScroll) {
-			y_offset += y - lastY; // adjust the scrolling offset based on the difference between the starting touch and the current touch
+			int dy = y - lastY; // finger delta since the last event
 			last2Y = lastY; // keep track of previous y locations so that we can tell how fast to scroll for kinetic scrolling
 			lastY = y; // update last touch to the current touch so we can tell how far and what direction we scroll for the next touch event
 
-			HandleScrolling();
+			if (mOverScroll != 0.0f) {
+				// Already past an edge: extend the rubber-band (with resistance)
+				// or retract it before the list itself starts moving again.
+				bool extending = (mOverScroll > 0 && dy > 0) || (mOverScroll < 0 && dy < 0);
+				if (extending) {
+					float maxOver = actualItemHeight * OVERSCROLL_MAX_ITEMS;
+					float resist = OVERSCROLL_RESIST * (1.0f - std::min(fabsf(mOverScroll) / maxOver, 0.9f));
+					mOverScroll += dy * resist;
+					if (mOverScroll > maxOver)
+						mOverScroll = maxOver;
+					else if (mOverScroll < -maxOver)
+						mOverScroll = -maxOver;
+				} else {
+					float prev = mOverScroll;
+					mOverScroll += dy; // retract toward the edge
+					if ((prev > 0 && mOverScroll < 0) || (prev < 0 && mOverScroll > 0)) {
+						y_offset += (int)mOverScroll; // crossed back: spend the remainder on the list
+						mOverScroll = 0.0f;
+						HandleScrolling();
+					}
+				}
+			} else {
+				y_offset += dy; // adjust the scrolling offset based on the difference between the starting touch and the current touch
+				HandleScrolling(); // generates rubber-band via FeedOverScroll if it hits an edge
+			}
 		} else
 			y_offset = 0;
 		mUpdate = 1;
@@ -675,6 +726,7 @@ int GUIScrollList::NotifyTouch(TOUCH_STATE state, int x, int y)
 			break;
 
 	case TOUCH_RELEASE:
+		mDragActive = false; // finger up: any overscroll now springs back
 		if (fastScroll)
 			mUpdate = 1; // get rid of touch effects on the fastscroll bar
 		fastScroll = 0;
@@ -693,12 +745,39 @@ int GUIScrollList::NotifyTouch(TOUCH_STATE state, int x, int y)
 			scrollingSpeed = lastY - last2Y;
 			if (abs(scrollingSpeed) < touchDebounce)
 				scrollingSpeed = 0;
+			if (mOverScroll != 0.0f)
+				scrollingSpeed = 0; // released while stretched: let the spring settle it
 		}
 	case TOUCH_REPEAT:
 	//case TOUCH_HOLD:
 		break;
 	}
 	return 0;
+}
+
+// Convert energy that would otherwise be hard-clamped at an edge into the
+// rubber-band overscroll. `excess` is signed (>0 past the top, <0 past the
+// bottom). During a drag we follow the finger with diminishing resistance;
+// during a fling we kick the band proportionally to the remaining momentum.
+void GUIScrollList::FeedOverScroll(int excess)
+{
+	if (!hasScroll)
+		return;
+	float maxOver = actualItemHeight * OVERSCROLL_MAX_ITEMS;
+	if (maxOver < 1.0f)
+		return;
+
+	if (mDragActive) {
+		float resist = OVERSCROLL_RESIST * (1.0f - std::min(fabsf(mOverScroll) / maxOver, 0.9f));
+		mOverScroll += excess * resist;
+	} else if (scrollingSpeed != 0) {
+		mOverScroll += scrollingSpeed * OVERSCROLL_FLING;
+	}
+
+	if (mOverScroll > maxOver)
+		mOverScroll = maxOver;
+	else if (mOverScroll < -maxOver)
+		mOverScroll = -maxOver;
 }
 
 void GUIScrollList::HandleScrolling()
@@ -714,6 +793,7 @@ void GUIScrollList::HandleScrolling()
 		}
 	}
 	if (firstDisplayedItem == 0 && y_offset > 0) {
+		FeedOverScroll(y_offset); // rubber-band past the top (or bounce a fling)
 		y_offset = 0; // user kept dragging downward past the top of the list, so always reset the offset to 0 since we can't scroll any further in this direction
 		scrollingSpeed = 0; // stop kinetic scrolling
 	}
@@ -745,6 +825,7 @@ void GUIScrollList::HandleScrolling()
 			currentPos += mItemPaddingTop;
 
 		if (currentPos > totalHeight - windowH) {
+			FeedOverScroll(-(currentPos - (totalHeight - windowH))); // rubber-band past the bottom
 			int newTopPos = totalHeight - windowH;
 			if (isGroup && newTopPos > mItemPaddingTop) {
 				firstDisplayedItem = (newTopPos - mItemPaddingTop) / actualItemHeight;
@@ -791,6 +872,14 @@ int GUIScrollList::NotifyVarChange(const std::string& varName, const std::string
 		}
 	}
 	return 0;
+}
+
+int GUIScrollList::GetNaturalHeight()
+{
+	int h = mHeaderH + (int)GetItemCount() * actualItemHeight;
+	if (isGroup)
+		h += mItemPaddingTop + mItemPaddingBottom;
+	return h;
 }
 
 int GUIScrollList::SetRenderPos(int x, int y, int w /* = 0 */, int h /* = 0 */)

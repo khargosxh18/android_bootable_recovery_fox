@@ -330,8 +330,19 @@
 				<image resource="actionbar_cancel"/>
 			</image>
 
+			<!-- Flash current OrangeFox (reflashtwrp): skip the "Done" page and
+			     drop straight back to advanced with a toast instead. -->
 			<action>
 				<condition var1="tw_operation_state" var2="1"/>
+				<condition var1="tw_action" var2="reflashtwrp"/>
+				<action function="overlay"/>
+				<action function="page">advanced</action>
+				<action function="toast">{@reflash_twrp_complete}</action>
+			</action>
+
+			<action>
+				<condition var1="tw_operation_state" var2="1"/>
+				<condition var1="tw_action" op="!=" var2="reflashtwrp"/>
 				<action function="overlay"/>
 				<action function="page">action_complete</action>
 			</action>

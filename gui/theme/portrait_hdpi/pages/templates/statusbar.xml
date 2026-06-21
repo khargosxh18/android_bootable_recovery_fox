@@ -118,8 +118,6 @@
 				<condition var1="tw_military_time" var2="1"/>
 				<condition var1="style_battery" var2="2"/>
 			</battery>
-
-
 		</template>
 	</templates>
 </recovery>

@@ -53,9 +53,24 @@ LOCAL_SRC_FILES := \
     gui/nanosvg.cpp \
     twrpDigestDriver.cpp \
     openrecoveryscript.cpp \
+    fox_fifo/fox_channel.cpp \
+    fox_fifo/fox_command_dispatcher.cpp \
+    fox_fifo/fox_fifo.cpp \
+    fox_fifo/fox_input.cpp \
+    fox_fifo/fox_protocol.cpp \
+    fox_fifo/fox_remote_input.cpp \
+    fox_fifo/fox_remote_state.cpp \
+    fox_fifo/fox_screen.cpp \
+    fox_fifo/fox_screen_service.cpp \
+    fox_fifo/fox_screen_stream.cpp \
     tarWrite.c \
     twrpAdbBuFifo.cpp \
     twrpRepacker.cpp
+
+LOCAL_STATIC_LIBRARIES += libjsoncpp
+LOCAL_C_INCLUDES += \
+    external/jsoncpp/include
+
 
 ifeq ($(TW_EXCLUDE_APEX),)
     LOCAL_SRC_FILES += twrpApex.cpp
@@ -124,9 +139,11 @@ LOCAL_C_INCLUDES += \
     $(LOCAL_PATH)/minuitwrp/include \
     $(LOCAL_PATH)/twinstall/include
 
-LOCAL_STATIC_LIBRARIES += libguitwrp libvold
+LOCAL_STATIC_LIBRARIES += libfoxui libvold
+# libvterm backs the in-UI terminal (gui/terminal.cpp).
+LOCAL_STATIC_LIBRARIES += libvterm
 LOCAL_SHARED_LIBRARIES += libz libc libcutils libstdc++ libtar libblkid libminuitwrp libmtdutils libtwadbbu
-LOCAL_SHARED_LIBRARIES += libbootloader_message libcrecovery libtwrpdigest libc++ libaosprecovery libcrypto libbase 
+LOCAL_SHARED_LIBRARIES += libbootloader_message libcrecovery libtwrpdigest libc++ libaosprecovery libcrypto libbase
 LOCAL_SHARED_LIBRARIES += libziparchive libselinux libdl_android.bootstrap
 
 ifneq ($(wildcard system/core/libsparse/Android.mk),)
@@ -313,10 +330,14 @@ endif
 ifneq ($(TW_ADDITIONAL_APEX_FILES),)
     LOCAL_CFLAGS += -DTW_ADDITIONAL_APEX_FILES=$(TW_ADDITIONAL_APEX_FILES)
 endif
-ifneq ($(TW_LOAD_VENDOR_MODULES),)
+
+ifneq ($(strip $(TW_LOAD_VENDOR_MODULES) $(TW_POST_DECRYPT_MODULES)),)
     LOCAL_SRC_FILES += kernel_module_loader.cpp
     LOCAL_C_INCLUDES += system/core/libmodprobe/include
     LOCAL_STATIC_LIBRARIES += libmodprobe
+endif
+
+ifneq ($(TW_LOAD_VENDOR_MODULES),)
     LOCAL_CFLAGS += -DTW_LOAD_VENDOR_MODULES=$(TW_LOAD_VENDOR_MODULES)
     ifeq ($(TW_LOAD_VENDOR_MODULES_EXCLUDE_GKI),true)
         LOCAL_CFLAGS += -DTW_LOAD_VENDOR_MODULES_EXCLUDE_GKI
@@ -328,6 +349,11 @@ ifneq ($(TW_LOAD_VENDOR_MODULES),)
         LOCAL_CFLAGS += -DTW_LOAD_PREBUILT_MODULES_AT_FIRST
     endif
 endif
+
+ifneq ($(TW_POST_DECRYPT_MODULES),)
+    LOCAL_CFLAGS += -DTW_POST_DECRYPT_MODULES=$(TW_POST_DECRYPT_MODULES)
+endif
+
 ifeq ($(TW_INCLUDE_CRYPTO), true)
     LOCAL_CFLAGS += -DTW_INCLUDE_CRYPTO -DUSE_FSCRYPT -Wno-macro-redefined
     LOCAL_SHARED_LIBRARIES += libgpt_twrp
@@ -628,6 +654,7 @@ ifeq ($(TW_INCLUDE_FB2PNG), true)
 endif
 ifneq ($(TW_OEM_BUILD),true)
     TWRP_REQUIRED_MODULES += orscmd
+    TWRP_REQUIRED_MODULES += foxcli
 endif
 ifeq ($(BOARD_USES_BML_OVER_MTD),true)
     TWRP_REQUIRED_MODULES += bml_over_mtd
@@ -698,12 +725,20 @@ LOCAL_POST_INSTALL_CMD := \
 
 # Darth9
 #
-# make sure that the terminfo directory is copied for nano
-ifeq ($(FOX_USE_NANO_EDITOR),1)
+# make sure that the nano config directory is copied for nano
+ifeq ($(OF_USE_NANO_EDITOR),1)
 	LOCAL_POST_INSTALL_CMD += \
 	mkdir -p $(TARGET_OUT_ETC)/; \
 	mkdir -p $(TARGET_RECOVERY_ROOT_OUT)/system/etc/; \
-	cp -rf $(TARGET_OUT_ETC)/nano $(TARGET_RECOVERY_ROOT_OUT)/system/etc/; \
+	cp -rf $(TARGET_OUT_ETC)/nano $(TARGET_RECOVERY_ROOT_OUT)/system/etc/;
+endif
+
+# Ship the terminfo database so terminal apps (vi/htop/less/...) work in the
+# in-UI terminal, which advertises TERM=xterm-256color (see gui/terminal.cpp).
+# This is independent of the nano editor; copy it whenever the source exists.
+ifneq ($(wildcard external/libncurses/lib/terminfo),)
+	LOCAL_POST_INSTALL_CMD += \
+	mkdir -p $(TARGET_RECOVERY_ROOT_OUT)/system/etc/; \
 	cp -rf external/libncurses/lib/terminfo $(TARGET_RECOVERY_ROOT_OUT)/system/etc/;
 endif
 
@@ -722,9 +757,9 @@ include $(BUILD_PHONY_PACKAGE)
 # ===============================
 include $(CLEAR_VARS)
 LOCAL_SRC_FILES := \
-    recovery-persist.cpp 
+    recovery-persist.cpp
 LOCAL_MODULE := recovery-persist
-LOCAL_SHARED_LIBRARIES := liblog libbase 
+LOCAL_SHARED_LIBRARIES := liblog libbase
 LOCAL_STATIC_LIBRARIES := libotautil librecovery_utils
 LOCAL_C_INCLUDES += $(LOCAL_PATH)/otautil/include
 LOCAL_C_INCLUDES += system/core/libstats/include

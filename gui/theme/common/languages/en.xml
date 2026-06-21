@@ -1266,5 +1266,6 @@
 		<string name="listbox_group_dynamic_part">Dynamic partitions</string>
 		<string name="listbox_group_additions">Additions</string>
 		<string name="partitions_management">Partitions Management</string>
+		
 	</resources>
 </language>

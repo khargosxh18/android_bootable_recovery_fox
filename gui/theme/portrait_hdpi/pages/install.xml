@@ -721,7 +721,7 @@
 				<action function="set">tw_complete_text1={@wipe_cache_dalvik_complete}</action>
 				<action function="set">tw_slider_text={@swipe_wipe}</action>
 				<action function="page">confirm_action</action>
-			</button -->
+			</button-->
 
 			<action>
 				<condition var1="tw_install_reboot" var2="1"/>

@@ -133,7 +133,20 @@ int GUIText::Render(void)
 	else
 		gr_color(mColor.red, mColor.green, mColor.blue, mColor.alpha);
 
-	gr_textEx_scaleW(mRenderX, mRenderY, mLastValue.c_str(), fontResource, maxWidth, mPlacement, scaleWidth);
+	// Multi-line: render each '\n'-separated line stacked by the font height.
+	// Single-line text (no '\n') takes the same path with one iteration.
+	int lineY = mRenderY;
+	size_t start = 0;
+	while (true) {
+		size_t nl = mLastValue.find('\n', start);
+		std::string line = (nl == std::string::npos) ? mLastValue.substr(start)
+							 : mLastValue.substr(start, nl - start);
+		gr_textEx_scaleW(mRenderX, lineY, line.c_str(), fontResource, maxWidth, mPlacement, scaleWidth);
+		if (nl == std::string::npos)
+			break;
+		lineY += mFontHeight;
+		start = nl + 1;
+	}
 
 	return 0;
 }
@@ -171,9 +184,25 @@ int GUIText::GetCurrentBounds(int& w, int& h)
 	if (mFont)
 		fontResource = mFont->GetResource();
 
-	h = mFontHeight;
 	mLastValue = gui_parse_text(mText);
-	w = twrpTruetype::gr_ttf_measureEx(mLastValue.c_str(), fontResource);
+
+	// Multi-line aware: width = widest line, height = lines * font height.
+	int lines = 0, maxw = 0;
+	size_t start = 0;
+	while (true) {
+		size_t nl = mLastValue.find('\n', start);
+		std::string line = (nl == std::string::npos) ? mLastValue.substr(start)
+							 : mLastValue.substr(start, nl - start);
+		int lw = twrpTruetype::gr_ttf_measureEx(line.c_str(), fontResource);
+		if (lw > maxw)
+			maxw = lw;
+		lines++;
+		if (nl == std::string::npos)
+			break;
+		start = nl + 1;
+	}
+	w = maxw;
+	h = mFontHeight * (lines > 0 ? lines : 1);
 	return 0;
 }
 

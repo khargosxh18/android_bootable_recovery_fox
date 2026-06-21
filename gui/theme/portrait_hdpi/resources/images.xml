@@ -19,6 +19,7 @@
 		<shape name="btn_raised_warn" w="%btn_w%" h="%btn_h%" radius="-1" color="#E51C23" />
 		<shape name="nav_empty" w="200" h="168" color="#00000000"/>
 		<shape name="nav_hl" color="#B8B8B842" radius="36" w="200" h="168"/>
+
 		<shape name="nb_gesture_line" w="210" h="7" color="%text%" radius="-1" />
 		<shape name="search_bar_bg" color="%cards_bg%" radius="36" w="984" h="260" />
 		<shape name="nav_pill" color="%accent%" radius="-1" w="%np_pill_w%" h="%np_pill_h%" />
@@ -97,6 +98,15 @@
 
 		<!-- Info -->
 		<image name="icon_warning" filename="Default/Info/icon_warning" retainaspect="1"/>
+
+		<!-- Toast/snackbar severity icons (bootstrap-style), tinted to match the
+		     card outline. 24x24 SVGs render at scale 3 (=72px, matching icon_warning);
+		     check.svg uses a 960 viewBox so scale 0.075 = 72px. -->
+		<image name="toast_ic_info"    filename="SVG/Icons/info.svg"    retainaspect="1" scale="3"     tint="%toast_c_info%"/>
+		<image name="toast_ic_success" filename="SVG/Icons/check.svg"   retainaspect="1" scale="0.075" tint="%toast_c_success%"/>
+		<image name="toast_ic_warning" filename="SVG/Icons/warning.svg" retainaspect="1" scale="3"     tint="%toast_c_warning%"/>
+		<image name="toast_ic_error"   filename="SVG/Icons/error.svg"   retainaspect="1" scale="3"     tint="%toast_c_error%"/>
+
 		<image name="db_hl" filename="Default/Dialog/db_hl"/>
 		<image name="db_empty" filename="Default/Dialog/db"/>
 		

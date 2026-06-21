@@ -319,7 +319,7 @@ func libGuiDefaults(ctx android.LoadHookContext) {
 }
 
 func init() {
-	android.RegisterModuleType("libguitwrp_defaults", libGuiDefaultsFactory)
+	android.RegisterModuleType("libfoxui_defaults", libGuiDefaultsFactory)
 }
 
 func libGuiDefaultsFactory() android.Module {

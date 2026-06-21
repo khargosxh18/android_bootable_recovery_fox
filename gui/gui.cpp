@@ -26,6 +26,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 #include <fcntl.h>
 #include <sys/reboot.h>
 #include <sys/stat.h>
@@ -36,6 +37,7 @@
 #include <sys/mount.h>
 #include <time.h>
 #include <unistd.h>
+#include <vector>
 
 extern "C"
 {
@@ -52,6 +54,10 @@ extern "C"
 #include "../twrp-functions.hpp"
 #include "../openrecoveryscript.hpp"
 #include "../orscmd/orscmd.h"
+#include "../fox_fifo/fox_channel.hpp"
+#include "../fox_fifo/fox_remote_state.hpp"
+#include "../fox_fifo/fox_screen_service.hpp"
+#include "../fox_fifo/fox_screen_stream.hpp"
 #include "blanktimer.hpp"
 #include "tw_atomic.hpp"
 
@@ -71,7 +77,7 @@ static int gGuiInitialized = 0;
 static TWAtomicInt gForceRender;
 blanktimer blankTimer;
 int ors_read_fd = -1;
-static FILE* orsout = NULL;
+static FILE* orsout = NULL;  // legacy ORS output FILE + command guard
 static float scale_theme_w = 1;
 static float scale_theme_h = 1;
 
@@ -333,7 +339,7 @@ void InputHandler::process_EV_ABS(input_event& ev)
 	x = ev.value >> 16;
 	y = ev.value & 0xFFFF;
 
-	#ifdef FOX_USE_MEIZU_TOUCH_MAPPING
+	#ifdef OF_USE_MEIZU_TOUCH_MAPPING
 	if (x > gr_fb_width() || y > gr_fb_height()) {
 		x /= 10;
 		y /= 10;
@@ -501,6 +507,10 @@ void InputHandler::handleDrag()
 
 void set_select_fd() {
 	select_fd = ors_read_fd + 1;
+	if (Fox_Channel::InputFd() >= select_fd)
+		select_fd = Fox_Channel::InputFd() + 1;
+	if (Fox_Channel::CancelFd() >= select_fd)
+		select_fd = Fox_Channel::CancelFd() + 1;
 	if (g_pty_fd >= select_fd)
 		select_fd = g_pty_fd + 1;
 	if (PartitionManager.uevent_pfd.fd >= select_fd)
@@ -700,8 +710,16 @@ static int runPages(const char *page_name, const int stop_on_page_done)
 			FD_SET(PartitionManager.uevent_pfd.fd, &fdset);
 		}
 #ifndef TW_OEM_BUILD
-		if (ors_read_fd > 0 && !orsout) { // orsout is non-NULL if a command is still running
+		bool command_active = Fox_Remote_State::CommandActive(orsout != NULL);
+		if (ors_read_fd > 0 && !command_active) {
 			FD_SET(ors_read_fd, &fdset);
+		}
+		if (Fox_Channel::InputFd() > 0 && !command_active) {
+			FD_SET(Fox_Channel::InputFd(), &fdset);
+		}
+		// Watched unconditionally -- cancellation must work while a command runs.
+		if (Fox_Channel::CancelFd() > 0) {
+			FD_SET(Fox_Channel::CancelFd(), &fdset);
 		}
 #endif
 		// TODO: combine this select with the poll done by input handling
@@ -711,9 +729,19 @@ static int runPages(const char *page_name, const int stop_on_page_done)
 				terminal_pty_read();
 			if (PartitionManager.uevent_pfd.fd > 0 && FD_ISSET(PartitionManager.uevent_pfd.fd, &fdset))
 				PartitionManager.read_uevent();
-			if (ors_read_fd > 0 && !orsout && FD_ISSET(ors_read_fd, &fdset))
+#ifndef TW_OEM_BUILD
+			if (ors_read_fd > 0 && !command_active && FD_ISSET(ors_read_fd, &fdset))
 				ors_command_read();
+			if (Fox_Channel::InputFd() > 0 && !command_active && FD_ISSET(Fox_Channel::InputFd(), &fdset))
+				Fox_Channel::HandleInput();
+			if (Fox_Channel::CancelFd() > 0 && FD_ISSET(Fox_Channel::CancelFd(), &fdset)) {
+				if (Fox_Channel::HandleCancel(orsout != NULL))
+					PartitionManager.Cancel_Backup();
+			}
+#endif
 		}
+		if (Fox_Remote_State::ShouldForceRender())
+			gForceRender.set_value(1);
 
 		if (!gForceRender.get_value())
 		{
@@ -730,6 +758,14 @@ static int runPages(const char *page_name, const int stop_on_page_done)
 #ifndef PRINT_RENDER_TIME
 			if (ret > 1)
 				PageManager::Render();
+
+			// Capture the just-rendered complete frame before flip() repoints
+			// gr_mem_surface to the back buffer (GUI thread, no race).
+			if (ret > 1) {
+				if (!Fox_Channel::CapturePendingFrameIfNeeded() &&
+				    !Fox_Screen_Stream::CaptureRenderedFrameIfDue())
+					Fox_Screen_Service::CaptureRenderedFrameIfWanted();
+			}
 
 			if (ret > 0)
 				flip();
@@ -757,6 +793,9 @@ static int runPages(const char *page_name, const int stop_on_page_done)
 		{
 			gForceRender.set_value(0);
 			PageManager::Render();
+			if (!Fox_Channel::CapturePendingFrameIfNeeded() &&
+			    !Fox_Screen_Stream::CaptureRenderedFrameIfDue())
+				Fox_Screen_Service::CaptureRenderedFrameIfWanted();
 			flip();
 			input_timeout_ms = 0;
 		}
@@ -773,6 +812,7 @@ static int runPages(const char *page_name, const int stop_on_page_done)
 	if (ors_read_fd > 0)
 		close(ors_read_fd);
 	ors_read_fd = -1;
+	Fox_Channel::Shutdown();
 	set_select_fd();
 	gGuiRunning = 0;
 	return 0;
@@ -922,8 +962,8 @@ extern "C" int gui_loadResources(void)
 	int check = 0;
 	DataManager::GetValue(TW_IS_ENCRYPTED, check);
 
-#ifdef FOX_ALLOW_EARLY_SETTINGS_LOAD
-#ifdef FOX_SETTINGS_ROOT_DIRECTORY
+#ifdef OF_ALLOW_EARLY_SETTINGS_LOAD
+#ifdef OF_SETTINGS_ROOT_DIRECTORY
 	if (PartitionManager.Mount_Settings_Storage(false))
 		DataManager::ReadSettingsFile();
 #else
@@ -981,8 +1021,8 @@ extern "C" int gui_loadResources(void)
 	PageManager::SelectPackage("OrangeFox");
 
 	gGuiInitialized = 1;
-#ifdef FOX_ALLOW_EARLY_SETTINGS_LOAD
-#ifdef FOX_SETTINGS_ROOT_DIRECTORY
+#ifdef OF_ALLOW_EARLY_SETTINGS_LOAD
+#ifdef OF_SETTINGS_ROOT_DIRECTORY
 	// Read the settings again to overwrite gui default settings that were loaded by PageManager::LoadPackage
 	if (PartitionManager.Mount_Settings_Storage(false))
 		DataManager::ReadSettingsFile();
@@ -1057,11 +1097,13 @@ extern "C" int gui_startPage(const char *page_name, const int allow_commands, in
 	{
 		if (ors_read_fd < 0)
 			setup_ors_command();
+		Fox_Channel::Setup();
 	} else {
 		if (ors_read_fd >= 0) {
 			close(ors_read_fd);
 			ors_read_fd = -1;
 		}
+		Fox_Channel::Shutdown();
 	}
 #endif
 	return runPages(page_name, stop_on_page_done);

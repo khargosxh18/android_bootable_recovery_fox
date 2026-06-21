@@ -1377,9 +1377,9 @@ void TWPartition::Setup_Data_Media() {
 		}
 	}
 	ExcludeAll(Mount_Point + "/media");
-#ifdef FOX_MISCELLANEOUS_ROOT_DIRECTORY
+#ifdef OF_MISCELLANEOUS_ROOT_DIRECTORY
 	if (TWFunc::Get_Root_Path(Fox_Home) == Mount_Point) {
-		Storage_Path = FOX_MISCELLANEOUS_ROOT_DIRECTORY;
+		Storage_Path = OF_MISCELLANEOUS_ROOT_DIRECTORY;
 	}
 #endif
 }
@@ -1644,6 +1644,7 @@ bool TWPartition::Mount(bool Display_Error) {
 	} else if (!Can_Be_Mounted) {
 		return false;
 	}
+
 
 	Find_Actual_Block_Device();
 
@@ -3031,8 +3032,10 @@ bool TWPartition::Raw_Read_Write(PartitionSettings *part_settings) {
 		goto exit;
 	}
 
-	if (part_settings->progress)
+	if (part_settings->progress) {
+		part_settings->progress->SetLabel(Backup_Display_Name);
 		part_settings->progress->SetPartitionSize(part_settings->total_restore_size);
+	}
 
 	while (Remain > 0) {
 		if (Remain < RW_Block_Size)
@@ -3080,8 +3083,10 @@ bool TWPartition::Backup_Dump_Image(PartitionSettings *part_settings) {
 	   gui_msg(Msg("backing_up=Backing up {1}...")(Backup_Display_Name));
 	}
 
-	if (part_settings->progress)
+	if (part_settings->progress) {
+		part_settings->progress->SetLabel(Backup_Display_Name);
 		part_settings->progress->SetPartitionSize(Backup_Size);
+	}
 
 	Backup_FileName = Backup_Name + "." + Current_File_System + ".win";
 	Full_FileName = part_settings->Backup_Folder + "/" + Backup_FileName;
@@ -3187,7 +3192,10 @@ bool TWPartition::Restore_Tar(PartitionSettings *part_settings) {
 	if (!Password.empty())
 		tar.setpassword(Password);
 #endif
-	part_settings->progress->SetPartitionSize(Get_Restore_Size(part_settings));
+	if (part_settings->progress) {
+		part_settings->progress->SetLabel(Backup_Display_Name);
+		part_settings->progress->SetPartitionSize(Get_Restore_Size(part_settings));
+	}
 	if (tar.extractTarFork() != 0)
 		ret = false;
 	else
@@ -3251,6 +3259,7 @@ bool TWPartition::Restore_Image(PartitionSettings *part_settings) {
 
 bool TWPartition::Update_Size(bool Display_Error) {
 	bool ret = false, Was_Already_Mounted = false, ro = false;
+	
 
 	Find_Actual_Block_Device();
 
@@ -3582,6 +3591,7 @@ bool TWPartition::Flash_Image_FI(const string& Filename, ProgressTracking *progr
 	gui_msg(Msg("flashing=Flashing {1}...")(Display_Name));
 	if (progress) {
 		file_size = (unsigned long long)(TWFunc::Get_File_Size(Filename));
+		progress->SetLabel(Display_Name);
 		progress->SetPartitionSize(file_size);
 	}
 	// Sometimes flash image doesn't like to flash due to the first 2KB matching, so we erase first to ensure that it flashes

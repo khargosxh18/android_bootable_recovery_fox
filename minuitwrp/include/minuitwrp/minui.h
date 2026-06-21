@@ -46,6 +46,13 @@ void gr_fb_blank(bool blank);
 
 void gr_color(unsigned char r, unsigned char g, unsigned char b, unsigned char a);
 void gr_clip(int x, int y, int w, int h);
+// Nested clipping: gr_clip_push intersects (x,y,w,h) with the currently
+// active clip and makes it the active region; gr_clip_pop restores the
+// previous one. While a region is pushed, plain gr_clip()/gr_noclip() calls
+// are intersected with / reset to it, so a child widget that sets its own clip
+// (e.g. a scroll list inside a scroll container) stays confined to the parent.
+void gr_clip_push(int x, int y, int w, int h);
+void gr_clip_pop();
 void gr_noclip();
 void gr_fill(int x, int y, int w, int h);
 void gr_line(int x0, int y0, int x1, int y1, int width);
@@ -66,6 +73,7 @@ int gr_ttf_getMaxFontHeight(void *font);
 void gr_ttf_dump_stats(void);
 
 void gr_blit(gr_surface source, int sx, int sy, int w, int h, int dx, int dy);
+void gr_blit_rotated(gr_surface source, int sx, int sy, int w, int h, int dx, int dy, int angle);
 unsigned int gr_get_width(gr_surface surface);
 unsigned int gr_get_height(gr_surface surface);
 int gr_get_surface(gr_surface* surface);

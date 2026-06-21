@@ -32,6 +32,13 @@
 					<action function="set">tw_reload_fm=1</action>
 					<action function="page">filemanagerlist</action>
 				</listitem>
+				<listitem name="NAS Storage">
+					<icon res="smb_share"/>
+					<condition var1="tw_nas_mounted" var2="1"/>
+					<action function="set">tw_file_location1=/mnt/nas</action>
+					<action function="set">tw_reload_fm=1</action>
+					<action function="page">filemanagerlist</action>
+				</listitem>
 				<listitem name="{@data_users}">
 					<icon res="group"/>
 					<condition var1="tw_is_fbe" var2="1"/>
@@ -984,5 +991,6 @@
 				<text>%ft_inf_sha5%</text>
 			</input>
 		</template>
+		
 	</templates>
 </recovery>

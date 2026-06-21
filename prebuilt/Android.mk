@@ -23,6 +23,10 @@ LOCAL_POST_INSTALL_CMD += $(hide) if [ -e "$(TARGET_RECOVERY_ROOT_OUT)/system/bi
 							if [ -e "$(TARGET_RECOVERY_ROOT_OUT)/system/bin/fgrep" ]; then \
 							rm $(TARGET_RECOVERY_ROOT_OUT)/system/bin/fgrep; fi; ln -s $(TARGET_RECOVERY_ROOT_OUT)/system/bin/grep $(TARGET_RECOVERY_ROOT_OUT)/system/bin/fgrep;
 
+# ttyd is now built from sources (external/ttyd, module ttyd_src) — see
+# orangefox.mk. It is launched on demand via the fox FIFO (fox terminal /
+# fox web), never as an init service, so no ttyd.rc is installed here.
+
 ifneq ($(wildcard external/zip/Android.mk),)
 ifneq ($(TW_EXCLUDE_ZIP), true)
 	RECOVERY_BINARY_SOURCE_FILES += $(TARGET_OUT_OPTIONAL_EXECUTABLES)/zip

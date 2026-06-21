@@ -64,6 +64,7 @@
 				<action function="set">adb_started=1</action>
 			</action>
 
+
 			<!-- Go to FM -->
 			<action>
 				<condition var1="first_start" op="!=" var2="1"/>

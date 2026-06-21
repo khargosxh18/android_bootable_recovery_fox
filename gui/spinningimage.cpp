@@ -7,7 +7,7 @@
 	<object type="spinningimage">
 		<placement x="..." y="..." placement="..."/>
 		<offset x="0" y="0"/>
-		<image resource="wlan_loading"/>
+		<image resource="loading"/>
 		<speed render="2"/>
 		<rotate speed="540" clockwise="1" start="0"/>
 	</object>

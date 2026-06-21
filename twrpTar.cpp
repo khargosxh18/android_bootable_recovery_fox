@@ -3,7 +3,7 @@
 	Copyright 2013 to 2020 TeamWin
 	This file is part of TWRP/TeamWin Recovery Project.
 
-	Copyright (C) 2018-2026 OrangeFox Recovery Project
+	Copyright (C) 2018-2024 OrangeFox Recovery Project
 	This file is part of the OrangeFox Recovery Project.
 
 	TWRP is free software: you can redistribute it and/or modify
@@ -451,6 +451,8 @@ int twrpTar::createTarFork(pid_t *tar_fork_pid) {
 			} else if (first_data == 1) {
 				// Second incoming data is total size
 				first_data = 2;
+				if (part_settings->Part)
+					part_settings->progress->SetLabel(part_settings->Part->Backup_Display_Name);
 				part_settings->progress->SetSizeCount(fs, file_count);
 			} else {
 				if (fs > 0) {

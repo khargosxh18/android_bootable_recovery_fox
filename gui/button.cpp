@@ -134,7 +134,10 @@ int GUIButton::Render(void)
 
 	if (mButtonImg)	 ret = mButtonImg->Render();
 	if (ret < 0)		return ret;
-	if (hasFill) {
+	// A fully-transparent fill draws nothing but still costs a full-region alpha
+	// blend (gr_fill keeps GGL_BLEND on when alpha != 255). Skip it - this is the
+	// common "invisible full-screen button" used purely as a touch region.
+	if (hasFill && mFillColor.alpha != 0) {
 		gr_color(mFillColor.red, mFillColor.green, mFillColor.blue, mFillColor.alpha);
 		gr_fill(mRenderX, mRenderY, mRenderW, mRenderH);
 	}

@@ -816,6 +816,26 @@ void OpenRecoveryScript::Run_CLI_Command(const char* command) {
 	LOGINFO("Done reading ORS command from command line\n");
 }
 
+// Run a single ORS command line through the standard ORS engine and return its
+// exit code. Used by the modern "fox" CLI to reuse the well-tested ORS handlers
+// (flash, sideload, format, wipe, set_active, reboot, ...) without duplicating
+// their logic. Unlike Run_CLI_Command(), this does not touch the FIFO callback.
+int OpenRecoveryScript::Run_ORS_Line(const std::string& command) {
+	if (!Insert_ORS_Command(command))
+		return 1;
+	return run_script_file();
+}
+
+// Copy an ORS script file into the temp folder and execute it, returning the
+// exit code. Used by 'fox ors <script>'.
+int OpenRecoveryScript::Run_ORS_File(const std::string& filename) {
+	if (copy_script_file(filename) == 0) {
+		LOGINFO("fox: unable to copy script file '%s'\n", filename.c_str());
+		return 1;
+	}
+	return run_script_file();
+}
+
 int OpenRecoveryScript::remountrw(void)
 {
 	bool remount_system = PartitionManager.Is_Mounted_By_Path(PartitionManager.Get_Android_Root_Path());

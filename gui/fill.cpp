@@ -65,9 +65,48 @@ GUIFill::~GUIFill()
 		gr_free_surface(mCircle);
 }
 
+GUIDivider::GUIDivider(xml_node<>* node) : GUIObject(node)
+{
+	// Everything except <spacer> paints a filled rect (<divider>, and the
+	// background of a <card>).
+	std::string nm = node ? node->name() : "";
+	mPaint = (nm != "spacer");
+	bool isDivider = (nm == "divider");
+
+	// Position/size straight off the element's attributes (a layout container
+	// overrides x/y). A divider defaults to a full-width 2px rule.
+	mRenderX = LoadAttrIntScaleX(node, "x", 0);
+	mRenderY = LoadAttrIntScaleY(node, "y", 0);
+	mRenderW = LoadAttrIntScaleX(node, "w", 0);
+	mRenderH = LoadAttrIntScaleY(node, "h", isDivider ? 2 : 0);
+	if (isDivider && mRenderW == 0)
+		mRenderW = gr_fb_width();
+
+	// Default to a subtle neutral rule; override with color=.
+	COLOR def;
+	def.red = def.green = def.blue = 128;
+	def.alpha = 60;
+	mColor = LoadAttrColor(node, "color", def);
+}
+
+int GUIDivider::Render(void)
+{
+	if (!isConditionTrue() || !mPaint)
+		return 0;
+
+	gr_color(mColor.red, mColor.green, mColor.blue, mColor.alpha);
+	gr_fill(mRenderX, mRenderY, mRenderW, mRenderH);
+	return 0;
+}
+
 int GUIFill::Render(void)
 {
 	if (!isConditionTrue())
+		return 0;
+
+	// A fully-transparent fill is invisible yet still costs a full-region alpha
+	// blend; skip it (e.g. <fill color="transparent"> used as a touch backing).
+	if (mColor.alpha == 0)
 		return 0;
 
 	gr_color(mColor.red, mColor.green, mColor.blue, mColor.alpha);

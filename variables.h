@@ -1,7 +1,7 @@
 /*
  * Copyright (C) 2007 The Android Open Source Project
  *
- * Copyright (C) 2018-2026 OrangeFox Recovery Project
+ * Copyright (C) 2018-2025 OrangeFox Recovery Project
  * This file is part of the OrangeFox Recovery Project.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,6 +31,7 @@
 #define FOX_DEVICE              FOX_DEVICE_MODEL
 #define OF_MAINTAINER_STR	"of_maintainer"
 #define OF_FLASHLIGHT_ENABLE_STR "of_flashlight_enable"
+
 
 // fordownloads values
 #define OF_SCREEN_H_S              "screen_original_h"
@@ -63,15 +64,15 @@ static const std::string Fox_Bin_Dir = "/system/bin";
 static const std::string Fox_Tmp = "/tmp";
 
 static const std::string Fox_Home =
-#ifdef FOX_MISCELLANEOUS_ROOT_DIRECTORY
-FOX_MISCELLANEOUS_ROOT_DIRECTORY"/Fox";
+#ifdef OF_MISCELLANEOUS_ROOT_DIRECTORY
+OF_MISCELLANEOUS_ROOT_DIRECTORY"/Fox";
 #else
 OF_STORAGE_PATH;
 #endif
 
 static const std::string Fox_Settings_Path =
-#ifdef FOX_SETTINGS_ROOT_DIRECTORY
-FOX_SETTINGS_ROOT_DIRECTORY"/Fox";
+#ifdef OF_SETTINGS_ROOT_DIRECTORY
+OF_SETTINGS_ROOT_DIRECTORY"/Fox";
 #else
 OF_STORAGE_PATH;
 #endif
@@ -178,6 +179,7 @@ static int Fox_Current_ROM_IsMIUI = 0; // is the currently installed ROM a MIUI 
 #define FOX_ENCRYPTED_DEVICE		"fox_encrypted_device"
 #define FOX_MEDIA_RW			"media_rw:media_rw"
 #define FOX_MEDIA_RW_DATA_FILE		"u:object_r:media_rw_data_file:s0"
+
 //
 #define TW_USE_COMPRESSION_VAR      	"tw_use_compression"
 #define TW_FILENAME                 	"tw_filename"
@@ -327,6 +329,7 @@ static int Fox_Current_ROM_IsMIUI = 0; // is the currently installed ROM a MIUI 
 
 // define maximum number of archives
 #define MAX_ARCHIVE_COUNT 247
+
 
 #ifndef CUSTOM_LUN_FILE
 #define CUSTOM_LUN_FILE 	"/config/usb_gadget/g1/functions/mass_storage.0/lun.%d/file"
