@@ -739,6 +739,7 @@ endif
 ifneq ($(wildcard external/libncurses/lib/terminfo),)
 	LOCAL_POST_INSTALL_CMD += \
 	mkdir -p $(TARGET_RECOVERY_ROOT_OUT)/system/etc/; \
+	rm -rf $(TARGET_RECOVERY_ROOT_OUT)/system/etc/terminfo; \
 	cp -rf external/libncurses/lib/terminfo $(TARGET_RECOVERY_ROOT_OUT)/system/etc/;
 endif
 
