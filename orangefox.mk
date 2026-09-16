@@ -63,7 +63,7 @@ endif
 
 OF_CURRENT_BRANCH := $(shell git -C $(call my-dir) branch --show-current 2>/dev/null)
 ifeq ($(OF_CURRENT_BRANCH),)
-    LOCAL_CFLAGS += -DOF_CURRENT_BRANCH='"broken repo"'
+    LOCAL_CFLAGS += -DOF_CURRENT_BRANCH='"(no branch)"'
 else
     LOCAL_CFLAGS += -DOF_CURRENT_BRANCH='"$(OF_CURRENT_BRANCH)"'
 endif
