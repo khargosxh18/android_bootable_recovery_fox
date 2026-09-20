@@ -205,6 +205,78 @@ bool InputHandler::processInput(int timeout_ms)
 		return (ret != -2);  // -2 means no more events in the queue
 	}
 
+#ifdef FOX_NO_BLANK_DT2W
+	// Display is only dimmed to 0, so touch remains active
+	if (blankTimer.isScreenOff()) {
+		static struct timeval last_off_tap = { 0, 0 };
+		static struct timeval off_touch_start = { 0, 0 };
+		static int off_start_x = 0;
+		static int off_start_y = 0;
+		static bool off_touch_active = false;
+		static bool off_touch_moved = false;
+
+		if (ev.type == EV_ABS) {
+			int touch_x = ev.value >> 16;
+			int touch_y = ev.value & 0xFFFF;
+
+			if (ev.code != 0) {
+				if (!off_touch_active) {
+					off_touch_active = true;
+					off_touch_moved = false;
+					off_start_x = touch_x;
+					off_start_y = touch_y;
+					gettimeofday(&off_touch_start, NULL);
+				} else {
+					int dx = touch_x - off_start_x;
+					int dy = touch_y - off_start_y;
+
+					if (dx < 0)
+						dx = -dx;
+					if (dy < 0)
+						dy = -dy;
+
+					if (dx > 50 || dy > 50)
+						off_touch_moved = true;
+				}
+			} else if (off_touch_active) {
+				struct timeval now;
+				gettimeofday(&now, NULL);
+
+				long touch_ms =
+					(now.tv_sec - off_touch_start.tv_sec) * 1000 +
+					(now.tv_usec - off_touch_start.tv_usec) / 1000;
+
+				if (!off_touch_moved && touch_ms <= 300) {
+					long delta_ms =
+						(now.tv_sec - last_off_tap.tv_sec) * 1000 +
+						(now.tv_usec - last_off_tap.tv_usec) / 1000;
+
+					if (last_off_tap.tv_sec != 0 &&
+					    delta_ms >= 80 && delta_ms <= 450) {
+						last_off_tap.tv_sec = 0;
+						last_off_tap.tv_usec = 0;
+						blankTimer.resetTimerAndUnblank();
+					} else {
+						last_off_tap = now;
+					}
+				} else {
+					last_off_tap.tv_sec = 0;
+					last_off_tap.tv_usec = 0;
+				}
+
+				off_touch_active = false;
+				off_touch_moved = false;
+			}
+
+			return true;
+		}
+
+		if (ev.type == EV_KEY &&
+		    ev.code >= BTN_DIGI && ev.code <= BTN_TOOL_QUADTAP)
+			return true;
+	}
+#endif
+
 	switch (ev.type)
 	{
 	case EV_ABS:

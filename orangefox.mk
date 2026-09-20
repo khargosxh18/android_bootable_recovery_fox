@@ -905,4 +905,14 @@ endif
 ifeq ($(OF_BLOCK_OPERATIONS_AFTER_ROM_FLASH),1)
     LOCAL_CFLAGS += -DOF_BLOCK_OPERATIONS_AFTER_ROM_FLASH='"1"'
 endif
+
+# GUI double-tap-to-wake for devices with screen blanking off
+ifeq ($(FOX_NO_BLANK_DT2W),1)
+    ifneq ($(TW_NO_SCREEN_BLANK),true)
+        $(warning 'FOX_NO_BLANK_DT2W' requires 'TW_NO_SCREEN_BLANK := true')
+        $(warning 'FOX_NO_BLANK_DT2W' will be ignored; proceeding with default screen wake behaviour)
+    else
+        LOCAL_CFLAGS += -DFOX_NO_BLANK_DT2W
+    endif
+endif
 #
