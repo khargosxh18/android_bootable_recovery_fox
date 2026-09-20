@@ -1,5 +1,5 @@
 /*
-	Copyright (C) 2021-2025 OrangeFox Recovery Project
+	Copyright (C) 2021-2026 OrangeFox Recovery Project
 	This file is part of the OrangeFox Recovery Project.
 	
 	OrangeFox is free software: you can redistribute it and/or modify
@@ -58,6 +58,10 @@ func fox_globalFlags(ctx android.BaseContext) []string {
 
 	if getMakeVars(ctx, "OF_USE_MEIZU_TOUCH_MAPPING") == "1" {
 		foxflags = append(foxflags, "-DOF_USE_MEIZU_TOUCH_MAPPING=1")
+	}
+
+	if ctx.AConfig().Getenv("FOX_NO_BLANK_DT2W") != "" {
+		foxflags = append(foxflags, "-DFOX_NO_BLANK_DT2W="+"\""+ctx.AConfig().Getenv("FOX_NO_BLANK_DT2W")+"\"")
 	}
 
 	return foxflags
