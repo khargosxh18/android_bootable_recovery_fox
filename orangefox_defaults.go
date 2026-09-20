@@ -64,6 +64,10 @@ func fox_globalFlags(ctx android.BaseContext) []string {
 		foxflags = append(foxflags, "-DFOX_NO_BLANK_DT2W="+"\""+ctx.AConfig().Getenv("FOX_NO_BLANK_DT2W")+"\"")
 	}
 
+	if ctx.AConfig().Getenv("FOX_NO_BLANK_DT2W") != "" {
+		foxflags = append(foxflags, "-DFOX_NO_BLANK_DT2W="+"\""+ctx.AConfig().Getenv("FOX_NO_BLANK_DT2W")+"\"")
+	}
+
 	return foxflags
 }
 
