@@ -2,7 +2,7 @@
 	Copyright 2013 bigbiff/Dees_Troy TeamWin
 	This file is part of TWRP/TeamWin Recovery Project.
 
-	Copyright (C) 2018-2025 OrangeFox Recovery Project
+	Copyright (C) 2018-2026 OrangeFox Recovery Project
 	This file is part of the OrangeFox Recovery Project.
 
 	TWRP is free software: you can redistribute it and/or modify
@@ -860,7 +860,7 @@ bool Page::ProcessNode(xml_node<>* page, std::vector<xml_node<>*> *templates, in
 		if (xml_attribute<>* st = child->first_attribute("style"))
 		{
 			if (!PageManager::FindStyle(st->value()))
-				LOGERR("FoxUiEngine: <%s> on page '%s' references unknown style \"%s\"\n",
+				LOGINFO("FoxUiEngine: <%s> on page '%s' references unknown style \"%s\"\n",
 						type.c_str(), mName.c_str(), st->value());
 		}
 
