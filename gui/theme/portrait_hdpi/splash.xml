@@ -43,13 +43,13 @@
 				<placement x="540" y="%center_y%" placement="4"/>
 			</image>
 
-			<text style="menu_text">
+			<text>
 				<placement x="540" y="%of%" placement="4"/>
 				<font resource="of" color="#ffffff"/>
 				<text>OrangeFox</text>
 			</text>
 
-			<text style="menu_text">
+			<text>
 				<placement x="540" y="%rec%" placement="4"/>
 				<font resource="recovery" color="#ffffff"/>
 				<text>Recovery</text>
