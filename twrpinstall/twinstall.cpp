@@ -41,6 +41,10 @@
 #include <cutils/properties.h>
 
 #include <android-base/unique_fd.h>
+#include <map>
+#include <set>
+#include <sys/statvfs.h>
+#include <update_engine/update_metadata.pb.h>
 
 #include "twcommon.h"
 #include "mtdutils/mounts.h"
@@ -282,6 +286,458 @@ static int Run_Update_Binary(const char *path, int* wipe_cache, zip_type ztype) 
 	return INSTALL_SUCCESS;
 }
 
+
+// ---------------------------------------------------------------------
+// high-speed A/B flash
+//
+// The normal AB install path hands the payload to update_engine, which
+// decompresses and hashes every operation one at a time on a single
+// thread -- that's the slow part, not the disk write. This path pulls the
+// partitions out in parallel with payload-dumper-go first, then flashes
+// the finished images through the same Flash_Image() code manual image
+// flashing already uses, and finally flips the active slot by hand since
+// update_engine never ran to do it for us.
+//
+// This only ever runs when the user explicitly turned it on for this zip,
+// and it only ever touches system/vendor/product/boot-type partitions --
+// firmware (bootloader, modem, trustzone...) is never written by this
+// path, so a failed write here can't leave the device unable to reach
+// fastboot. If anything goes wrong, the install just stops -- there's no
+// silent fallback to the normal path once a partition may have been
+// written, because at that point falling back could mean two different
+// code paths both trying to modify the same slot.
+// ---------------------------------------------------------------------
+
+namespace {
+
+const char* kHighSpeedDumperPath = "/system/bin/payload-dumper-static";
+const char* kHighSpeedScratchDir = "/data/hsf_extract";
+
+// how much extra free space to require on top of what the partitions
+// actually need, so extraction doesn't run /data down to zero -- 5% or
+// 256MB, whichever is bigger
+const uint64_t kHighSpeedStorageMarginMin = 256ULL * 1024 * 1024;
+
+const size_t kPayloadMagicSize = 4;
+const size_t kPayloadVersionSize = 8;
+const size_t kPayloadManifestSizeSize = 8;
+const size_t kPayloadSignatureSizeSize = 4;
+
+// firmware and bootloader-ish partitions -- never flashed by this path,
+// on purpose. flash these the normal way, separately.
+const std::set<std::string>& HighSpeedExcludedPartitions() {
+	static const std::set<std::string> excluded = {
+		"abl", "aop", "aop_config", "bluetooth", "countrycode", "cpucp",
+		"cpucp_dtb", "devcfg", "dsp", "featenabler", "hyp", "imagefv",
+		"keymaster", "modem", "modemfirmware", "multiimgqti", "qupfw",
+		"shrm", "tz", "uefi", "uefisecapp", "xbl", "xbl_config", "xbl_ramdump",
+	};
+	return excluded;
+}
+
+struct HighSpeedPartitionPlan {
+	std::string name;          // bare partition name from the payload manifest
+	std::string target_path;   // the TWRP path Find_Partition_By_Path() expects
+	uint64_t expanded_size = 0; // decompressed size, straight from the manifest
+};
+
+uint64_t ReadBigEndian64(const uint8_t* p) {
+	uint64_t v = 0;
+	for (int i = 0; i < 8; i++)
+		v = (v << 8) | p[i];
+	return v;
+}
+
+// this is a plain lookup table, not something derived automatically --
+// the payload only knows partition group names, it has no idea what path
+// TWRP mounts them under, so this has to be kept in sync by hand with
+// whatever partitions your builds actually ship
+std::string ResolveTargetPath(const std::string& bare_name) {
+	static const std::map<std::string, std::string> physical = {
+		{"boot", "/boot"}, {"dtbo", "/dtbo"}, {"init_boot", "/init_boot"},
+		{"recovery", "/recovery"}, {"vbmeta", "/vbmeta"},
+		{"vbmeta_system", "/vbmeta_system"}, {"vendor_boot", "/vendor_boot"},
+	};
+	static const std::map<std::string, std::string> logical = {
+		{"odm", "/odm"}, {"product", "/product"}, {"system", "/system"},
+		{"system_dlkm", "/system_dlkm"}, {"system_ext", "/system_ext"},
+		{"vendor", "/vendor"}, {"vendor_dlkm", "/vendor_dlkm"},
+	};
+	auto p = physical.find(bare_name);
+	if (p != physical.end())
+		return p->second;
+	auto l = logical.find(bare_name);
+	if (l != logical.end())
+		return l->second;
+	return "";
+}
+
+// payload-dumper-go can't decode these op types yet, so we check for them
+// up front instead of finding out partway through extraction
+bool OpTypeIsSupported(chromeos_update_engine::InstallOperation::Type type) {
+	using Op = chromeos_update_engine::InstallOperation;
+	switch (type) {
+		case Op::PUFFDIFF:
+		case Op::ZUCCHINI:
+		case Op::LZ4DIFF_BSDIFF:
+		case Op::LZ4DIFF_PUFFDIFF:
+			return false;
+		default:
+			return true;
+	}
+}
+
+// reads payload.bin's header straight out of the zip and parses the
+// manifest, so we know which partitions exist and whether anything in
+// there is a format we can't handle -- before touching disk at all
+bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip,
+                            std::vector<HighSpeedPartitionPlan>* plan) {
+	plan->clear();
+
+	ZipEntry64 payload_entry;
+	if (FindEntry(zip, "payload.bin", &payload_entry) != 0) {
+		LOGERR("high-speed probe: payload.bin not found in zip\n");
+		return false;
+	}
+
+	// we read payload.bin's bytes straight off disk at its zip offset
+	// below, which only lines up correctly if the entry is stored
+	// uncompressed inside the zip -- most OTA tooling does this already,
+	// but if it isn't, bail rather than read garbage
+	if (payload_entry.method != 0) {
+		LOGERR("high-speed probe: payload.bin is compressed inside the zip, can't read it directly\n");
+		return false;
+	}
+
+	size_t to_read = std::min<uint64_t>(payload_entry.uncompressed_length, 4 * 1024 * 1024);
+	std::vector<uint8_t> buf(to_read);
+
+	android::base::unique_fd fd(open(package_path.c_str(), O_RDONLY | O_CLOEXEC));
+	if (fd == -1) {
+		LOGERR("high-speed probe: couldn't open the zip file\n");
+		return false;
+	}
+
+	size_t got = 0;
+	while (got < to_read) {
+		ssize_t r = pread(fd.get(), buf.data() + got, to_read - got, payload_entry.offset + got);
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			LOGERR("high-speed probe: read failed (%s)\n", strerror(errno));
+			return false;
+		}
+		if (r == 0) {
+			LOGERR("high-speed probe: hit end of file early while reading payload.bin\n");
+			return false;
+		}
+		got += r;
+	}
+
+	size_t off = 0;
+	if (to_read < kPayloadMagicSize + kPayloadVersionSize + kPayloadManifestSizeSize ||
+	    memcmp(buf.data(), "CrAU", kPayloadMagicSize) != 0) {
+		LOGERR("high-speed probe: payload.bin doesn't start with the expected magic\n");
+		return false;
+	}
+	off += kPayloadMagicSize;
+
+	uint64_t version = ReadBigEndian64(buf.data() + off);
+	off += kPayloadVersionSize;
+	if (version != 2) {
+		LOGERR("high-speed probe: payload version %llu isn't one we understand\n",
+			(unsigned long long)version);
+		return false;
+	}
+
+	uint64_t manifest_size = ReadBigEndian64(buf.data() + off);
+	off += kPayloadManifestSizeSize;
+
+	if (off + kPayloadSignatureSizeSize > to_read) {
+		LOGERR("high-speed probe: payload header is truncated\n");
+		return false;
+	}
+	off += kPayloadSignatureSizeSize;
+
+	if (off + manifest_size > to_read) {
+		// the manifest is bigger than our first read grabbed -- read again
+		// with a buffer sized for the whole thing
+		to_read = off + manifest_size;
+		buf.assign(to_read, 0);
+		got = 0;
+		while (got < to_read) {
+			ssize_t r = pread(fd.get(), buf.data() + got, to_read - got, payload_entry.offset + got);
+			if (r < 0) {
+				if (errno == EINTR)
+					continue;
+				LOGERR("high-speed probe: read failed while re-reading the full manifest (%s)\n", strerror(errno));
+				return false;
+			}
+			if (r == 0) {
+				LOGERR("high-speed probe: hit end of file early while re-reading the manifest\n");
+				return false;
+			}
+			got += r;
+		}
+	}
+
+	chromeos_update_engine::DeltaArchiveManifest manifest;
+	if (!manifest.ParseFromArray(buf.data() + off, manifest_size)) {
+		LOGERR("high-speed probe: couldn't parse the payload manifest\n");
+		return false;
+	}
+
+	if (manifest.minor_version() != 0) {
+		// a nonzero minor version means this is a delta payload, which
+		// references an old partition we don't have lying around in the
+		// shape this path expects -- full payloads only here
+		LOGERR("high-speed probe: this is a delta payload, not a full one -- not supported here\n");
+		return false;
+	}
+
+	for (const auto& part : manifest.partitions()) {
+		if (HighSpeedExcludedPartitions().count(part.partition_name())) {
+			LOGINFO("high-speed probe: skipping firmware partition '%s', flash it separately\n",
+				part.partition_name().c_str());
+			continue;
+		}
+
+		for (const auto& op : part.operations()) {
+			if (!OpTypeIsSupported(op.type())) {
+				LOGERR("high-speed probe: partition '%s' uses an operation type we can't decode\n",
+					part.partition_name().c_str());
+				return false;
+			}
+		}
+
+		HighSpeedPartitionPlan entry;
+		entry.name = part.partition_name();
+		entry.target_path = ResolveTargetPath(entry.name);
+		entry.expanded_size = part.new_partition_info().size();
+		if (entry.target_path.empty()) {
+			LOGERR("high-speed probe: don't know where partition '%s' should be flashed, stopping rather than guess\n",
+				entry.name.c_str());
+			return false;
+		}
+		plan->push_back(std::move(entry));
+	}
+
+	return !plan->empty();
+}
+
+}  // namespace
+
+enum class HighSpeedResult {
+	kNotApplicable,  // the toggle was off, or this isn't an A/B payload zip -- run the normal path
+	kAborted,        // toggle was on and something went wrong -- stop, don't fall back
+	kSucceeded,
+};
+
+// deletes the scratch extraction folder whenever this goes out of scope,
+// win or lose, so a multi-gigabyte pile of extracted images never sits
+// around on /data after the install finishes or fails
+struct HighSpeedScratchGuard {
+	~HighSpeedScratchGuard() { TWFunc::removeDir(kHighSpeedScratchDir, false); }
+};
+
+// Flash_Image() writes to whatever slot is currently "active" as far as
+// TWPartitionManager is concerned, and that's the slot recovery itself
+// booted from. We need to write the *other* slot, so this overrides which
+// slot Flash_Image() targets for as long as we're flashing, and always
+// puts it back afterward -- including if something throws or we return
+// early, since it cleans up in its destructor either way.
+struct HighSpeedSlotOverride {
+	std::string original;
+	bool active = false;
+	void Enter(const std::string& target) {
+		original = PartitionManager.Get_Active_Slot_Display();
+		PartitionManager.Override_Active_Slot(target);
+		active = true;
+	}
+	void Restore() {
+		if (!active)
+			return;
+		PartitionManager.Override_Active_Slot(original);
+		active = false;
+	}
+	~HighSpeedSlotOverride() { Restore(); }
+};
+
+HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHandle zip) {
+	if (!DataManager::GetIntValue("tw_high_speed_flash"))
+		return HighSpeedResult::kNotApplicable;
+
+	ZipEntry64 unused;
+	if (FindEntry(zip, "payload_properties.txt", &unused) != 0)
+		return HighSpeedResult::kNotApplicable;
+
+	// from here on the toggle is on and this really is an A/B payload zip,
+	// so every way out below is kAborted -- we never quietly drop back to
+	// the normal path once we've gotten this far
+	if (access(kHighSpeedDumperPath, X_OK) != 0) {
+		gui_err("High-speed flash is turned on but the dumper tool isn't on this build. Stopping.");
+		return HighSpeedResult::kAborted;
+	}
+
+	gui_print("High-speed flash: reading the payload...\n");
+	std::vector<HighSpeedPartitionPlan> plan;
+	if (!ProbeHighSpeedPayload(package, zip, &plan)) {
+		gui_err("This package doesn't work with high-speed flash (delta payload or an operation type we can't decode). Turn off high-speed flash for this package and try again.");
+		return HighSpeedResult::kAborted;
+	}
+
+	// only bother cleaning up if something's actually there -- removeDir
+	// on a path that doesn't exist yet just prints a scary-looking "no
+	// such file" line for no reason
+	if (access(kHighSpeedScratchDir, F_OK) == 0)
+		TWFunc::removeDir(kHighSpeedScratchDir, false);
+	if (mkdir(kHighSpeedScratchDir, 0700) != 0 && errno != EEXIST) {
+		gui_err("Couldn't create the scratch folder for high-speed extraction.");
+		return HighSpeedResult::kAborted;
+	}
+	HighSpeedScratchGuard scratch_guard;
+
+	uint64_t required_bytes = 0;
+	std::vector<std::string> names;
+	{
+		// pass the dumper the biggest partitions first -- it starts them
+		// in the order we give it, and the biggest one is what decides
+		// how long the whole extraction takes, so it shouldn't be sitting
+		// queued behind a bunch of small ones
+		std::vector<const HighSpeedPartitionPlan*> by_size;
+		for (auto& part : plan) {
+			required_bytes += part.expanded_size;
+			by_size.push_back(&part);
+		}
+		std::stable_sort(by_size.begin(), by_size.end(),
+			[](const HighSpeedPartitionPlan* a, const HighSpeedPartitionPlan* b) {
+				return a->expanded_size > b->expanded_size;
+			});
+		for (auto* part : by_size)
+			names.push_back(part->name);
+	}
+
+	uint64_t margin = std::max<uint64_t>(kHighSpeedStorageMarginMin, required_bytes / 20);
+	uint64_t needed_bytes = required_bytes + margin;
+
+	struct statvfs vfs {};
+	if (statvfs(kHighSpeedScratchDir, &vfs) != 0) {
+		gui_err("Couldn't check free space for high-speed flash. Stopping.");
+		return HighSpeedResult::kAborted;
+	}
+	uint64_t available_bytes = (uint64_t)vfs.f_bavail * (uint64_t)vfs.f_frsize;
+	if (available_bytes < needed_bytes) {
+		char msg[256];
+		snprintf(msg, sizeof(msg),
+			"Not enough free space for high-speed flash: need about %llu MB, only %llu MB free. Free up space or turn off high-speed flash.",
+			(unsigned long long)(needed_bytes / (1024 * 1024)),
+			(unsigned long long)(available_bytes / (1024 * 1024)));
+		gui_err(msg);
+		return HighSpeedResult::kAborted;
+	}
+
+	std::string joined_names;
+	for (size_t i = 0; i < names.size(); i++) {
+		if (i > 0)
+			joined_names += ",";
+		joined_names += names[i];
+	}
+
+	gui_print("High-speed flash: extracting partitions, this takes some seconds...\n");
+
+	time_t extract_start, extract_stop;
+	time(&extract_start);
+
+	const char* dumper_args[] = {
+		kHighSpeedDumperPath,
+		"-c", "8",
+		"-p", joined_names.c_str(),
+		"-o", kHighSpeedScratchDir,
+		package.c_str(),
+		nullptr
+	};
+
+	int status = 0;
+	pid_t pid = fork();
+	if (pid == 0) {
+		// keep the dumper's own chatter off the recovery UI -- if it fails,
+		// the exit code below is what we actually act on
+		int null_fd = open("/dev/null", O_WRONLY);
+		if (null_fd != -1) {
+			dup2(null_fd, STDOUT_FILENO);
+			dup2(null_fd, STDERR_FILENO);
+			close(null_fd);
+		}
+		execv(dumper_args[0], const_cast<char**>(dumper_args));
+		_exit(127);
+	} else if (pid < 0) {
+		gui_err("Couldn't start the high-speed extractor. Stopping.");
+		return HighSpeedResult::kAborted;
+	}
+	waitpid(pid, &status, 0);
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+		gui_err("High-speed extraction failed, or a checksum didn't match. No partitions were touched.");
+		return HighSpeedResult::kAborted;
+	}
+
+	time(&extract_stop);
+	int extract_secs = (int) difftime(extract_stop, extract_start);
+	gui_print("High-speed flash: extraction done in %ds, flashing the inactive slot...\n", extract_secs);
+
+	std::string original_slot = PartitionManager.Get_Active_Slot_Display();
+	std::string target_slot = (original_slot == "A") ? "B" : "A";
+
+	HighSpeedSlotOverride slot_override;
+	slot_override.Enter(target_slot);
+
+	// Flash_Image(directory, filename) doesn't take the target partition
+	// as an argument -- it reads it from tw_flash_partition, the same way
+	// the normal manual "flash image" screen sets it up
+	DataManager::SetValue("tw_flash_both_slots", 0);
+	bool flash_ok = true;
+	std::string failed_part;
+	for (auto& part : plan) {
+		std::string directory = kHighSpeedScratchDir;
+		std::string filename = part.name + ".img";
+		DataManager::SetValue("tw_flash_partition", part.target_path + ";");
+		DataManager::SetValue("tw_partition", part.target_path);
+		if (!PartitionManager.Flash_Image(directory, filename)) {
+			flash_ok = false;
+			failed_part = part.name;
+			break;
+		}
+	}
+	DataManager::SetValue("tw_flash_partition", "");
+	slot_override.Restore();  // back to the booted slot before we touch the bootloader's active-slot setting
+
+	if (!flash_ok) {
+		gui_err(("High-speed flash failed writing '" + failed_part +
+			"'. The slot you booted from wasn't touched and the active slot wasn't changed, "
+			"You Can Either Flash Using Normal Method, Or Reboot To Previous System Normally.").c_str());
+		return HighSpeedResult::kAborted;
+	}
+
+	// update_engine never ran, so nothing told the bootloader to switch
+	// slots -- that's the one piece of its job we still have to do
+	// ourselves, and only now that every partition has actually succeeded
+	PartitionManager.Set_Active_Slot(target_slot);
+	if (PartitionManager.Get_Active_Slot_Display() != target_slot) {
+		gui_err(("Every partition was written and verified, but switching to slot " + target_slot +
+			" didn't take. Switch to it manually from the slot menu before rebooting.").c_str());
+		return HighSpeedResult::kAborted;
+	}
+
+	if (android::base::GetBoolProperty("ro.virtual_ab.enabled", false)) {
+		PartitionManager.Unlock_Block_Partitions();
+		PartitionManager.Prepare_All_Super_Volumes();
+		gui_warn("mount_vab_partitions=Devices on super may not mount until after rebooting recovery.");
+	}
+
+        gui_print("1 min flash is cool right, it's done (^-^), now reboot to recovery again\n\n");
+	return HighSpeedResult::kSucceeded;
+}
+// ---------------------------------------------------------------------
+
 int TWinstall_zip(const char *path, int *wipe_cache, bool check_for_digest)
 {
   int ret_val, zip_verify = 1, unmount_system = 1, reflashtwrp = 0, unmount_vendor = 1;
@@ -300,8 +756,8 @@ int TWinstall_zip(const char *path, int *wipe_cache, bool check_for_digest)
      {
          DataManager::SetValue(FOX_ZIP_INSTALLER_CODE, 0); // internal zip = standard zip installer
          DataManager::SetValue(FOX_ZIP_INSTALLER_TREBLE, 0);
-     }    
-  else   
+     }
+  else
     {
 	gui_msg(Msg("installing_zip=Installing zip file '{1}'")(path));
 	if (strlen(path) < 9 || strncmp(path, "/sideload", 9) != 0) {
@@ -433,40 +889,51 @@ int TWinstall_zip(const char *path, int *wipe_cache, bool check_for_digest)
 		ZipEntry64 ab_binary_entry;
 		if (FindEntry(Zip, ab_binary_name, &ab_binary_entry) == 0) {
 			LOGINFO("AB zip\n");
-			gui_msg(Msg(msg::kHighlight, "flash_ab_inactive=Flashing A/B zip to inactive slot: {1}")(PartitionManager.Get_Active_Slot_Display()=="A"?"B":"A"));
-			// We need this so backuptool can do its magic
-			bool system_mount_state = PartitionManager.Is_Mounted_By_Path(PartitionManager.Get_Android_Root_Path());
-			bool vendor_mount_state = PartitionManager.Is_Mounted_By_Path("/vendor");
-			PartitionManager.Mount_By_Path(PartitionManager.Get_Android_Root_Path(), false);
-			PartitionManager.Mount_By_Path("/vendor", false);
-			TWFunc::copy_file("/system/bin/sh", "/tmp/sh", 0755);
-			mount("/tmp/sh", "/system/bin/sh", "auto", MS_BIND, NULL);
 
-			run_rom_scripts = true;
-			usleep(32);
+			HighSpeedResult hs_res = TryHighSpeedAbInstall(path, Zip);
+			if (hs_res == HighSpeedResult::kSucceeded) {
+				DataManager::SetValue(FOX_ZIP_INSTALLER_CODE, 1); // mark as custom ROM install
+				ret_val = INSTALL_SUCCESS;
+			} else if (hs_res == HighSpeedResult::kAborted) {
+				ret_val = INSTALL_ERROR;
+			} else {
+				// high-speed flash wasn't on for this install -- run the normal
+				// update_engine path exactly like before
+				gui_msg(Msg(msg::kHighlight, "flash_ab_inactive=Flashing A/B zip to inactive slot: {1}")(PartitionManager.Get_Active_Slot_Display()=="A"?"B":"A"));
+				// We need this so backuptool can do its magic
+				bool system_mount_state = PartitionManager.Is_Mounted_By_Path(PartitionManager.Get_Android_Root_Path());
+				bool vendor_mount_state = PartitionManager.Is_Mounted_By_Path("/vendor");
+				PartitionManager.Mount_By_Path(PartitionManager.Get_Android_Root_Path(), false);
+				PartitionManager.Mount_By_Path("/vendor", false);
+				TWFunc::copy_file("/system/bin/sh", "/tmp/sh", 0755);
+				mount("/tmp/sh", "/system/bin/sh", "auto", MS_BIND, NULL);
 
-			if (run_rom_scripts && TWFunc::Path_Exists(FOX_PRE_ROM_FLASH_SCRIPT)) {
-				TWFunc::RunFoxScript(FOX_PRE_ROM_FLASH_SCRIPT, path);
+				run_rom_scripts = true;
+				usleep(32);
+
+				if (run_rom_scripts && TWFunc::Path_Exists(FOX_PRE_ROM_FLASH_SCRIPT)) {
+					TWFunc::RunFoxScript(FOX_PRE_ROM_FLASH_SCRIPT, path);
+				}
+
+				TWFunc::IsRecoveryOverwritten(true);
+
+				ret_val = Run_Update_Binary(path, wipe_cache, AB_OTA_ZIP_TYPE);
+
+				DataManager::SetValue(FOX_ZIP_INSTALLER_CODE, 1); // mark as custom ROM install
+
+				umount("/system/bin/sh");
+				unlink("/tmp/sh");
+				if (!vendor_mount_state)
+					PartitionManager.UnMount_By_Path("/vendor", false);
+				if (!system_mount_state)
+					PartitionManager.UnMount_By_Path(PartitionManager.Get_Android_Root_Path(), false);
+				if (android::base::GetBoolProperty("ro.virtual_ab.enabled", false)) {
+					PartitionManager.Unlock_Block_Partitions();
+					PartitionManager.Prepare_All_Super_Volumes();
+					gui_warn("mount_vab_partitions=Devices on super may not mount until after rebooting recovery.");
+				}
+				gui_warn("flash_ab_reboot=To flash additional zips, please reboot recovery to switch to the updated slot.");
 			}
-
-			TWFunc::IsRecoveryOverwritten(true);
-
-			ret_val = Run_Update_Binary(path, wipe_cache, AB_OTA_ZIP_TYPE);
-
-			DataManager::SetValue(FOX_ZIP_INSTALLER_CODE, 1); // mark as custom ROM install
-
-			umount("/system/bin/sh");
-			unlink("/tmp/sh");
-			if (!vendor_mount_state)
-				PartitionManager.UnMount_By_Path("/vendor", false);
-			if (!system_mount_state)
-				PartitionManager.UnMount_By_Path(PartitionManager.Get_Android_Root_Path(), false);
-			if (android::base::GetBoolProperty("ro.virtual_ab.enabled", false)) {
-				PartitionManager.Unlock_Block_Partitions();
-				PartitionManager.Prepare_All_Super_Volumes();
-				gui_warn("mount_vab_partitions=Devices on super may not mount until after rebooting recovery.");
-			}
-			gui_warn("flash_ab_reboot=To flash additional zips, please reboot recovery to switch to the updated slot.");
 		} else {
 			std::string binary_name("ui.xml");
 			ZipEntry64 binary_entry;

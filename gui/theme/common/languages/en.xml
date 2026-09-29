@@ -1246,6 +1246,7 @@
 		<string name="reflash_twrp">Flash current OrangeFox</string>
 		<string name="reflashing_twrp">Flashing OrangeFox...</string>
 		<string name="reflash_twrp_complete">Done flashing OrangeFox</string>
+                <string name="high_speed_flash_chk">High-speed flash (BETA)</string>
 
 		<string name="auto_disable_avb2">Disable vbmeta AVB2.0 after ROM flash</string>
 		<string name="disable_avb2">Disable vbmeta AVB2.0</string>

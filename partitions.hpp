@@ -181,6 +181,7 @@ public:
 	std::string Get_Display_Name();                                           // Get the display name in the gui for the partition
 	bool Is_SlotSelect();                                                     // Return whether the partition is a slot partition or not
 	bool Get_Super_Status();						  // Returns true if partition is a super volume mounted partitions
+	void Set_Block_Device(std::string block_device);			  // the high-speed flash path needs to call this from outside the class, after it remaps a logical partition
 	string Get_Mount_Point();						  // Return Mount_Point or directory the current partition is mounted on
 	void Set_Can_Be_Backed_Up(bool val);					  // Update whether the partition can be backed up or not
 	void Set_Can_Be_Wiped(bool val);					  // Update whether the partition can be wiped or not
@@ -199,7 +200,6 @@ public:
 protected:
 	bool Has_Data_Media;                                                      // Indicates presence of /data/media, may affect wiping and backup methods
 	void Setup_Data_Media();                                                  // Sets up a partition as a /data/media emulated storage partition
-	void Set_Block_Device(std::string block_device);			  // Allow super partition setup to change block device
 
 private:
 	bool Process_Fstab_Line(const char *fstab_line, bool Display_Error, std::map<string, Flags_Map> *twrp_flags); // Processes a fstab line

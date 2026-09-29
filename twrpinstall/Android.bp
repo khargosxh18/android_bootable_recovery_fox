@@ -43,6 +43,9 @@ cc_defaults {
     static_libs: [
         "libotautil",
 
+        // needed to parse the OTA payload manifest for the high-speed flash path
+        "update_metadata-protos",
+
         // external dependencies    
         "libvintf",
         "libfstab",

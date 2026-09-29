@@ -3335,6 +3335,130 @@ bool TWPartitionManager::Remove_MTP_Storage(unsigned int Storage_ID) {
 	return false;
 }
 
+
+// A logical partition inside Super comes back read-only from first-stage
+// mount, on any Virtual A/B device. Manual "flash image" never had to care
+// about this because it's normally only used on boot/dtbo/recovery -- plain
+// dd-flashable partitions that were never mounted read-only in the first
+// place. The high-speed ROM flash path needs to write full filesystem
+// images (system, vendor, product...) straight into Super, so before that
+// write happens the partition has to be unmapped and remapped writable.
+// If the new image is bigger than what's currently allocated for the
+// partition, this also grows it first, using whatever free space is left
+// in the Super group.
+bool Ensure_Logical_Partition_Writable(TWPartitionManager* manager, TWPartition* twrp_part,
+                                        uint64_t requested_size) {
+	if (!manager || !twrp_part || !twrp_part->Get_Super_Status())
+		return false;
+
+	// Super metadata can't safely be touched while a snapshot update is
+	// mid-flight -- bail rather than risk corrupting it.
+	auto snapshots = android::snapshot::SnapshotManager::NewForFirstStageMount();
+	if (snapshots && snapshots->GetUpdateState() != android::snapshot::UpdateState::None) {
+		LOGERR("Refusing to modify a logical partition while a snapshot update is active\n");
+		gui_err("Logical partitions cannot be resized while an Android snapshot update is active.");
+		return false;
+	}
+
+	const std::string slot_suffix = manager->Get_Active_Slot_Suffix();
+	const uint32_t metadata_slot = android::fs_mgr::SlotNumberForSlotSuffix(slot_suffix);
+	const std::string super_device = manager->Get_Super_Partition();
+	const std::string bare_name = manager->Get_Bare_Partition_Name(twrp_part->Get_Mount_Point());
+
+	auto builder = MetadataBuilder::New(super_device, metadata_slot);
+	if (!builder) {
+		LOGERR("Unable to read logical partition metadata from '%s'\n", super_device.c_str());
+		gui_err("Unable to read the Super partition metadata.");
+		return false;
+	}
+
+	std::string partition_name = bare_name + slot_suffix;
+	auto logical = builder->FindPartition(partition_name);
+	if (!logical) {
+		partition_name = bare_name;
+		logical = builder->FindPartition(partition_name);
+	}
+	if (!logical) {
+		LOGERR("Logical partition '%s' was not found in Super metadata\n", bare_name.c_str());
+		gui_err("The selected logical partition is missing from Super metadata.");
+		return false;
+	}
+
+	const uint64_t current_size = logical->size();
+	const bool needs_resize = requested_size > current_size;
+
+	if (needs_resize) {
+		if (!builder->ResizePartition(logical, requested_size)) {
+			LOGERR("Not enough free space in logical group to grow '%s' from %llu to %llu bytes\n",
+				partition_name.c_str(), static_cast<unsigned long long>(current_size),
+				static_cast<unsigned long long>(requested_size));
+			gui_err("The image is larger than the logical partition and its Super group has insufficient free space.");
+			return false;
+		}
+		auto updated = builder->Export();
+		if (!updated) {
+			gui_err("Unable to prepare updated Super partition metadata.");
+			return false;
+		}
+
+		// liblp expects a boot slot index here (0 or 1), not an index into
+		// however many metadata slots the device reserves -- a Virtual A/B
+		// device can reserve a third slot for snapshots, but that slot is
+		// never a valid target for this call, so we only ever touch the
+		// table for the slot we already loaded above.
+		auto original = android::fs_mgr::ReadMetadata(super_device, metadata_slot);
+		if (!original) {
+			LOGERR("Unable to preserve Super metadata slot %u before resize\n", metadata_slot);
+			gui_err("Unable to preserve the current Super partition metadata.");
+			return false;
+		}
+
+		// the inactive slot's partitions are usually never mapped at boot in
+		// the first place, so there's often nothing here to release -- that's
+		// expected, not a failure
+		if (!DestroyLogicalPartition(partition_name))
+			LOGINFO("'%s' wasn't mapped yet, nothing to release before resize\n", partition_name.c_str());
+
+		if (!android::fs_mgr::UpdatePartitionTable(super_device, *updated, metadata_slot)) {
+			LOGERR("Failed to commit resized logical partition metadata; restoring original table\n");
+			android::fs_mgr::UpdatePartitionTable(super_device, *original, metadata_slot);
+			gui_err("Unable to update the Super partition metadata; the original layout was restored.");
+			return false;
+		}
+	} else {
+		// if this partition was already mapped (true for the active slot),
+		// release it so it can be remapped writable below. if it wasn't
+		// mapped at all -- the normal case for the inactive slot, which is
+		// what high-speed flash targets -- there's nothing to release, and
+		// that's fine, not an error
+		if (!DestroyLogicalPartition(partition_name))
+			LOGINFO("'%s' wasn't mapped yet, nothing to release before remap\n", partition_name.c_str());
+	}
+
+	android::fs_mgr::CreateLogicalPartitionParams params = {
+		.block_device = super_device,
+		.metadata_slot = metadata_slot,
+		.partition_name = partition_name,
+		.force_writable = true,
+		.timeout_ms = std::chrono::seconds(5),
+	};
+	std::string mapped_path;
+	if (!android::fs_mgr::CreateLogicalPartition(params, &mapped_path)) {
+		LOGERR("Unable to map logical partition '%s' writable\n", partition_name.c_str());
+		gui_err("Unable to map the logical partition writable.");
+		return false;
+	}
+
+	twrp_part->Set_Block_Device(mapped_path);
+	if (needs_resize)
+		twrp_part->Update_Size(true);
+	LOGINFO("remapped logical partition '%s' writable (resized: %s, %llu -> %llu bytes)\n",
+		partition_name.c_str(), needs_resize ? "yes" : "no",
+		static_cast<unsigned long long>(current_size),
+		static_cast<unsigned long long>(requested_size));
+	return true;
+}
+
 bool TWPartitionManager::Flash_Image(string& path, string& filename) {
 	twrpRepacker repacker;
 	int partition_count = 0;
@@ -3407,6 +3531,15 @@ bool TWPartitionManager::Flash_Image(string& path, string& filename) {
 
 	DataManager::SetProgress(0.0);
 	if (flash_part) {
+		// A logical partition is mapped read-only at boot, so it needs to be
+		// remapped writable before we hand it to TWPartition::Flash_Image --
+		// a plain dd-flashable partition like boot or dtbo never needed this,
+		// which is why stock TWRP never had this step.
+		if (flash_part->Get_Super_Status()) {
+			uint64_t image_size = TWFunc::Get_File_Size(full_filename);
+			if (!Ensure_Logical_Partition_Writable(this, flash_part, image_size))
+				return false;
+		}
 		flash_part->Backup_FileName = filename;
 		if (!flash_part->Flash_Image(&part_settings))
 			return false;
