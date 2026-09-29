@@ -595,14 +595,14 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	// so every way out below is kAborted -- we never quietly drop back to
 	// the normal path once we've gotten this far
 	if (access(kHighSpeedDumperPath, X_OK) != 0) {
-		gui_err("High-speed flash is turned on but the dumper tool isn't on this build. Stopping.");
+		gui_err("hs_dumper_missing=High-speed flash is turned on but the dumper tool isn't on this build. Stopping.");
 		return HighSpeedResult::kAborted;
 	}
 
 	gui_print("High-speed flash: reading the payload...\n");
 	std::vector<HighSpeedPartitionPlan> plan;
 	if (!ProbeHighSpeedPayload(package, zip, &plan)) {
-		gui_err("This package doesn't work with high-speed flash (delta payload or an operation type we can't decode). Turn off high-speed flash for this package and try again.");
+		gui_err("hs_probe_failed=This package doesn't work with high-speed flash (delta payload or an operation type we can't decode). Turn off high-speed flash for this package and try again.");
 		return HighSpeedResult::kAborted;
 	}
 
@@ -620,7 +620,7 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	if (access(kHighSpeedScratchDir, F_OK) == 0)
 		TWFunc::removeDir(kHighSpeedScratchDir, false);
 	if (mkdir(kHighSpeedScratchDir, 0700) != 0 && errno != EEXIST) {
-		gui_err("Couldn't create the scratch folder for high-speed extraction.");
+		gui_err("hs_scratch_mkdir_failed=Couldn't create the scratch folder for high-speed extraction.");
 		return HighSpeedResult::kAborted;
 	}
 	HighSpeedScratchGuard scratch_guard;
@@ -650,14 +650,14 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 
 	struct statvfs vfs {};
 	if (statvfs(kHighSpeedScratchDir, &vfs) != 0) {
-		gui_err("Couldn't check free space for high-speed flash. Stopping.");
+		gui_err("hs_statvfs_failed=Couldn't check free space for high-speed flash. Stopping.");
 		return HighSpeedResult::kAborted;
 	}
 	uint64_t available_bytes = (uint64_t)vfs.f_bavail * (uint64_t)vfs.f_frsize;
 	if (available_bytes < needed_bytes) {
 		char msg[256];
 		snprintf(msg, sizeof(msg),
-			"Not enough free space for high-speed flash: need about %llu MB, only %llu MB free. Free up space or turn off high-speed flash.",
+			"hs_low_storage=Not enough free space for high-speed flash: need about %llu MB, only %llu MB free. Free up space or turn off high-speed flash.",
 			(unsigned long long)(needed_bytes / (1024 * 1024)),
 			(unsigned long long)(available_bytes / (1024 * 1024)));
 		gui_err(msg);
@@ -688,23 +688,24 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	int status = 0;
 	pid_t pid = fork();
 	if (pid == 0) {
-		// keep the dumper's own chatter off the recovery UI -- if it fails,
-		// the exit code below is what we actually act on
+		// silence the dumper's normal progress output, but leave stderr
+		// alone -- it inherits recovery's own stderr, which goes to
+		// recovery.log, so if the dumper crashes or hits a fatal error we
+		// actually see why instead of just getting a bare nonzero exit code
 		int null_fd = open("/dev/null", O_WRONLY);
 		if (null_fd != -1) {
 			dup2(null_fd, STDOUT_FILENO);
-			dup2(null_fd, STDERR_FILENO);
 			close(null_fd);
 		}
 		execv(dumper_args[0], const_cast<char**>(dumper_args));
 		_exit(127);
 	} else if (pid < 0) {
-		gui_err("Couldn't start the high-speed extractor. Stopping.");
+		gui_err("hs_dumper_launch_failed=Couldn't start the high-speed extractor. Stopping.");
 		return HighSpeedResult::kAborted;
 	}
 	waitpid(pid, &status, 0);
 	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-		gui_err("High-speed extraction failed, or a checksum didn't match. No partitions were touched.");
+		gui_err("hs_extraction_failed=High-speed extraction failed, or a checksum didn't match. No partitions were touched.");
 		return HighSpeedResult::kAborted;
 	}
 
@@ -739,7 +740,7 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	slot_override.Restore();  // back to the booted slot before we touch the bootloader's active-slot setting
 
 	if (!flash_ok) {
-		gui_err(("High-speed flash failed writing '" + failed_part +
+		gui_err(("hs_flash_failed=High-speed flash failed writing '" + failed_part +
 			"'. The slot you booted from wasn't touched and the active slot wasn't changed, "
 			"You Can Either Flash Using Normal Method, Or Reboot To Previous System Normally.").c_str());
 		return HighSpeedResult::kAborted;
@@ -754,7 +755,7 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	// ourselves, and only now that every partition has actually succeeded
 	PartitionManager.Set_Active_Slot(target_slot);
 	if (PartitionManager.Get_Active_Slot_Display() != target_slot) {
-		gui_err(("Every partition was written and verified, but switching to slot " + target_slot +
+		gui_err(("hs_slot_switch_failed=Every partition was written and verified, but switching to slot " + target_slot +
 			" didn't take. Switch to it manually from the slot menu before rebooting.").c_str());
 		return HighSpeedResult::kAborted;
 	}
