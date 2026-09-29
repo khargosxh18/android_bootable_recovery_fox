@@ -327,7 +327,7 @@ const size_t kPayloadSignatureSizeSize = 4;
 // on purpose. flash these the normal way, separately.
 const std::set<std::string>& HighSpeedExcludedPartitions() {
 	static const std::set<std::string> excluded = {
-		"abl", "aop", "aop_config", "bluetooth", "countrycode", "cpucp",
+		"recovery", "abl", "aop", "aop_config", "bluetooth", "countrycode", "cpucp",
 		"cpucp_dtb", "devcfg", "dsp", "featenabler", "hyp", "imagefv",
 		"keymaster", "modem", "modemfirmware", "multiimgqti", "qupfw",
 		"shrm", "tz", "uefi", "uefisecapp", "xbl", "xbl_config", "xbl_ramdump",
@@ -355,8 +355,8 @@ uint64_t ReadBigEndian64(const uint8_t* p) {
 std::string ResolveTargetPath(const std::string& bare_name) {
 	static const std::map<std::string, std::string> physical = {
 		{"boot", "/boot"}, {"dtbo", "/dtbo"}, {"init_boot", "/init_boot"},
-		{"recovery", "/recovery"}, {"vbmeta", "/vbmeta"},
-		{"vbmeta_system", "/vbmeta_system"}, {"vendor_boot", "/vendor_boot"},
+		{"vbmeta", "/vbmeta"}, {"vbmeta_system", "/vbmeta_system"},
+		{"vendor_boot", "/vendor_boot"},
 	};
 	static const std::map<std::string, std::string> logical = {
 		{"odm", "/odm"}, {"product", "/product"}, {"system", "/system"},
@@ -370,6 +370,26 @@ std::string ResolveTargetPath(const std::string& bare_name) {
 	if (l != logical.end())
 		return l->second;
 	return "";
+}
+
+// the currently running recovery IS OrangeFox, and we never touch the
+// booted slot's recovery partition -- so once the ROM partitions are
+// done, just copy the running recovery straight onto the other slot.
+bool ReflashSelfToOtherSlot(const std::string& source_slot, const std::string& target_slot) {
+	std::string source_suffix = (source_slot == "A") ? "_a" : "_b";
+	std::string target_suffix = (target_slot == "A") ? "_a" : "_b";
+	std::string source_path = "/dev/block/bootdevice/by-name/recovery" + source_suffix;
+	std::string target_path = "/dev/block/bootdevice/by-name/recovery" + target_suffix;
+	std::string cmd = "dd if='" + source_path + "' of='" + target_path + "' bs=1M";
+	if (TWFunc::Exec_Cmd(cmd) != 0) {
+		LOGERR("high-speed: failed copying OrangeFox from '%s' to '%s'\n",
+			source_path.c_str(), target_path.c_str());
+		return false;
+	}
+	sync();
+	LOGINFO("high-speed: copied OrangeFox onto the other slot's recovery ('%s' -> '%s')\n",
+		source_path.c_str(), target_path.c_str());
+	return true;
 }
 
 // payload-dumper-go can't decode these op types yet, so we check for them
@@ -586,6 +606,14 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 		return HighSpeedResult::kAborted;
 	}
 
+	// if a normal install got interrupted before, libsnapshot can leave
+	// state behind here that makes Ensure_Logical_Partition_Writable's
+	// "is an update in progress" check refuse to touch anything -- clear
+	// it the same way a fresh update_engine run always does at the start
+	PartitionManager.Mount_By_Path("/metadata", false);
+	if (TWFunc::Path_Exists("/metadata/ota"))
+		TWFunc::removeDir("/metadata/ota", false);
+
 	// only bother cleaning up if something's actually there -- removeDir
 	// on a path that doesn't exist yet just prints a scary-looking "no
 	// such file" line for no reason
@@ -716,6 +744,10 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 			"You Can Either Flash Using Normal Method, Or Reboot To Previous System Normally.").c_str());
 		return HighSpeedResult::kAborted;
 	}
+
+	if (!ReflashSelfToOtherSlot(original_slot, target_slot))
+		gui_warn("hs_recovery_copy_failed=High-speed flash: couldn't copy OrangeFox onto the other slot's recovery. "
+		         "You may need to flash it there manually before switching to that slot.");
 
 	// update_engine never ran, so nothing told the bootloader to switch
 	// slots -- that's the one piece of its job we still have to do
