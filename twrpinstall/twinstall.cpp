@@ -945,22 +945,93 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	const char* dumper_args[] = {
 		kHighSpeedDumperPath,
 		"-c", "8",
-		"-q", // Silence payload-dumper-go's terminal animation spam
+		"-m", // machine-readable: one "<partition>:<percent>" line per percent, no animated bars
 		"-p", joined_names.c_str(),
 		"-o", kHighSpeedLinkDir,
 		package.c_str(),
 		nullptr
 	};
 
+	// the dumper's stdout is a pipe we read progress lines from. stderr is
+	// left alone (goes to recovery.log) so a dumper crash still explains itself
+	int out_pipe[2];
+	if (pipe2(out_pipe, O_CLOEXEC) != 0) {
+		LOGERR("high-speed: pipe2 failed (%s)\n", strerror(errno));
+		gui_err("hs_dumper_launch_failed=Couldn't start the high-speed extractor. Nothing has been extracted; the active slot wasn't changed.");
+		return HighSpeedResult::kAborted;
+	}
+
 	int status = 0;
 	pid_t pid = fork();
 	if (pid == 0) {
+		dup2(out_pipe[1], STDOUT_FILENO);  // dup2 result has no CLOEXEC, so it survives exec
 		execv(dumper_args[0], const_cast<char**>(dumper_args));
 		_exit(127);
 	} else if (pid < 0) {
-		gui_err("hs_dumper_launch_failed=Couldn't start the high-speed extractor. Nothing was written; the active slot wasn't changed.");
+		close(out_pipe[0]);
+		close(out_pipe[1]);
+		gui_err("hs_dumper_launch_failed=Couldn't start the high-speed extractor. Nothing has been extracted; the active slot wasn't changed.");
 		return HighSpeedResult::kAborted;
 	}
+	close(out_pipe[1]);
+
+	// overall progress = each partition's percent weighted by its size.
+	// never shown as 100: a partition reads 100 before its checksum/verity
+	// work has finished, and completion is announced by the "written and
+	// flushed" line once the dumper has exited cleanly
+	{
+		std::map<std::string, uint64_t> part_size;
+		std::map<std::string, int> part_pct;
+		uint64_t total_bytes = 0;
+		for (auto& part : plan) {
+			part_size[part.name] = part.expanded_size;
+			part_pct[part.name] = 0;
+			total_bytes += part.expanded_size;
+		}
+		int last_shown = -1;
+		std::string pending;
+		char chunk[512];
+		for (;;) {
+			ssize_t r = read(out_pipe[0], chunk, sizeof(chunk));
+			if (r < 0) {
+				if (errno == EINTR)
+					continue;
+				break;
+			}
+			if (r == 0)
+				break;  // dumper closed stdout (it exited)
+			pending.append(chunk, r);
+			size_t nl;
+			while ((nl = pending.find('\n')) != std::string::npos) {
+				std::string line = pending.substr(0, nl);
+				pending.erase(0, nl + 1);
+				size_t colon = line.rfind(':');
+				if (colon == std::string::npos || total_bytes == 0)
+					continue;
+				auto it = part_pct.find(line.substr(0, colon));
+				if (it == part_pct.end())
+					continue;
+				int pct = atoi(line.c_str() + colon + 1);
+				it->second = std::max(0, std::min(100, pct));
+				uint64_t weighted = 0;
+				for (auto& kv : part_pct)
+					weighted += (uint64_t)kv.second * part_size[kv.first];
+				int overall = std::min<int>(99, (int)(weighted / total_bytes));
+				if (overall != last_shown) {
+					last_shown = overall;
+					// the GUI console is append-only and can't rewrite a line it
+					// already printed, so the live percentage goes to the progress
+					// bar instead (same mechanism the normal path's "set_progress"
+					// uses) -- one element updating in place, no line spam
+					DataManager::SetProgress(((float)overall) / 100.0f);
+				}
+			}
+			if (pending.size() > 4096)
+				pending.clear();  // never let a runaway line grow forever
+		}
+	}
+	close(out_pipe[0]);
+
 	pid_t waited;
 	do {
 		waited = waitpid(pid, &status, 0);
@@ -971,6 +1042,8 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 			target_slot + " is now incomplete. You Can Either Flash Using Normal Method, Or Reboot To Previous System Normally.").c_str());
 		return HighSpeedResult::kAborted;
 	}
+
+	DataManager::SetProgress(1.0f);
 
 	// the dumper writes through the page cache and doesn't fsync device
 	// nodes. flush every target explicitly, then a global sync, and only
