@@ -3471,7 +3471,10 @@ bool Ensure_Logical_Partition_Writable(TWPartitionManager* manager, TWPartition*
 // normal OTA (see PreparePartitionsForUpdate in its own logs).
 bool TWPartitionManager::Rebuild_Logical_Group_For_High_Speed_Flash(
 		const std::string& slot_suffix,
-		const std::vector<std::pair<std::string, uint64_t>>& partitions) {
+		const std::vector<std::pair<std::string, uint64_t>>& partitions,
+		std::map<std::string, std::string>* mapped_paths) {
+	if (mapped_paths)
+		mapped_paths->clear();
 	if (partitions.empty())
 		return true;
 
@@ -3577,6 +3580,8 @@ bool TWPartitionManager::Rebuild_Logical_Group_For_High_Speed_Flash(
 			gui_err(("Unable to map '" + kv.first + "' after rebuilding the Super group.").c_str());
 			return false;
 		}
+		if (mapped_paths)
+			(*mapped_paths)[kv.first] = mapped_path;
 		TWPartition* twp = PartitionManager.Find_Partition_By_Path("/" + kv.first);
 		if (twp) {
 			twp->Set_Block_Device(mapped_path);

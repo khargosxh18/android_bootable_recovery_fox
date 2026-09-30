@@ -181,6 +181,7 @@ public:
 	std::string Get_Display_Name();                                           // Get the display name in the gui for the partition
 	bool Is_SlotSelect();                                                     // Return whether the partition is a slot partition or not
 	bool Get_Super_Status();						  // Returns true if partition is a super volume mounted partitions
+	std::string Get_Primary_Block_Device();					  // Returns the bare fstab block device path (never slot-suffixed for SlotSelect partitions)
 	void Set_Block_Device(std::string block_device);			  // the high-speed flash path needs to call this from outside the class, after it remaps a logical partition
 	string Get_Mount_Point();						  // Return Mount_Point or directory the current partition is mounted on
 	void Set_Can_Be_Backed_Up(bool val);					  // Update whether the partition can be backed up or not
@@ -421,7 +422,8 @@ public:
 
 	bool Flash_Image(string& path, string& filename);                         // Flashes an image to a selected partition from the partition list
 	bool Rebuild_Logical_Group_For_High_Speed_Flash(const std::string& slot_suffix,
-		const std::vector<std::pair<std::string, uint64_t>>& partitions);       // rebuilds a Super group in one pass for a full-payload high-speed flash, avoiding the sequential-resize starvation problem
+		const std::vector<std::pair<std::string, uint64_t>>& partitions,
+		std::map<std::string, std::string>* mapped_paths = nullptr);       // rebuilds a Super group in one pass for a full-payload high-speed flash, avoiding the sequential-resize starvation problem
 	bool Flash_Repacked_Image(string& path, string& filename, bool recovery); // Reflash repacked image...
 	
 	bool Restore_Partition(struct PartitionSettings *part_settings);          // Restore the partitions based on type
