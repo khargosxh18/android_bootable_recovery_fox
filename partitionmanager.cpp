@@ -3545,7 +3545,7 @@ bool TWPartitionManager::Rebuild_Logical_Group_For_High_Speed_Flash(
 
 	for (auto& kv : partitions) {
 		std::string pname = kv.first + slot_suffix;
-		Partition* p = builder->AddPartition(pname, group_name, 0 /* LP_PARTITION_ATTR_NONE */);
+		auto* p = builder->AddPartition(pname, group_name, 0 /* LP_PARTITION_ATTR_NONE */);
 		if (!p || !builder->ResizePartition(p, kv.second)) {
 			LOGERR("Unable to add/size partition '%s' at %llu bytes\n",
 				pname.c_str(), (unsigned long long)kv.second);
