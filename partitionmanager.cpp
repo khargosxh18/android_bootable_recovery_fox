@@ -3469,9 +3469,19 @@ bool Ensure_Logical_Partition_Writable(TWPartitionManager* manager, TWPartition*
 // group and re-adds them all at once, sized exactly for what's about to
 // be flashed. Same thing update_engine itself does at the start of a
 // normal OTA (see PreparePartitionsForUpdate in its own logs).
+//
+// declared_group_name / declared_group_size come from the payload's own
+// manifest (DynamicPartitionMetadata.groups): the name is unsuffixed, the
+// size is the budget this ROM was built for. When given, that size is used
+// instead of whatever the metadata currently on the device says, so a
+// stale or shrunken group budget left by a previous ROM can't make a
+// perfectly valid ROM look too big. If the live group's name doesn't match
+// the declared one we stop rather than guess. Pass an empty name / 0 to
+// keep the old behavior of trusting the live metadata.
 bool TWPartitionManager::Rebuild_Logical_Group_For_High_Speed_Flash(
 		const std::string& slot_suffix,
 		const std::vector<std::pair<std::string, uint64_t>>& partitions,
+		const std::string& declared_group_name, uint64_t declared_group_size,
 		std::map<std::string, std::string>* mapped_paths) {
 	if (mapped_paths)
 		mapped_paths->clear();
@@ -3520,6 +3530,26 @@ bool TWPartitionManager::Rebuild_Logical_Group_For_High_Speed_Flash(
 		return false;
 	}
 	uint64_t group_max_size = group->maximum_size();
+
+	// everything above is read-only; nothing has been touched yet, so these
+	// checks can still bail out for free
+	if (!declared_group_name.empty() && declared_group_size > 0) {
+		const std::string declared_full_name = declared_group_name + slot_suffix;
+		if (group_name != declared_full_name) {
+			LOGERR("Payload declares group '%s' but the device's partitions are in group '%s' -- refusing to guess\n",
+				declared_full_name.c_str(), group_name.c_str());
+			gui_err("The Super partition group on this device doesn't match the one this ROM declares. Nothing was changed.");
+			return false;
+		}
+		if (declared_group_size != group_max_size)
+			LOGINFO("Group '%s': using the payload's declared size %llu instead of the device's current %llu\n",
+				group_name.c_str(), (unsigned long long)declared_group_size,
+				(unsigned long long)group_max_size);
+		group_max_size = declared_group_size;
+	} else {
+		LOGINFO("Group '%s': payload declared no group size, keeping the device's current %llu\n",
+			group_name.c_str(), (unsigned long long)group_max_size);
+	}
 
 	// release any of these that happen to be mapped right now -- can't
 	// touch their metadata while they're mapped
