@@ -319,7 +319,7 @@ static int Run_Update_Binary(const char *path, int* wipe_cache, zip_type ztype) 
 
 namespace {
 
-const char* kHighSpeedDumperPath = "/system/bin/payload-dumper-static";
+const char* kHighSpeedDumperPath = "/system/bin/payload-dumper-go";
 // directory of symlinks handed to the dumper as its output dir. lives on
 // the recovery ramdisk (tmpfs), holds only tiny symlinks, never real data
 const char* kHighSpeedLinkDir = "/tmp/hsf_links";
