@@ -339,6 +339,7 @@ struct HighSpeedPartitionPlan {
 	std::string name;          // bare partition name from the payload manifest
 	std::string target_path;   // the TWRP path Find_Partition_By_Path() expects
 	uint64_t expanded_size = 0; // decompressed size, straight from the manifest
+	bool is_logical = false;   // true if this one lives in Super (needs the group rebuild)
 };
 
 uint64_t ReadBigEndian64(const uint8_t* p) {
@@ -352,7 +353,7 @@ uint64_t ReadBigEndian64(const uint8_t* p) {
 // the payload only knows partition group names, it has no idea what path
 // TWRP mounts them under, so this has to be kept in sync by hand with
 // whatever partitions your builds actually ship
-std::string ResolveTargetPath(const std::string& bare_name) {
+std::string ResolveTargetPath(const std::string& bare_name, bool* is_logical = nullptr) {
 	static const std::map<std::string, std::string> physical = {
 		{"boot", "/boot"}, {"dtbo", "/dtbo"}, {"init_boot", "/init_boot"},
 		{"vbmeta", "/vbmeta"}, {"vbmeta_system", "/vbmeta_system"},
@@ -364,11 +365,15 @@ std::string ResolveTargetPath(const std::string& bare_name) {
 		{"vendor", "/vendor"}, {"vendor_dlkm", "/vendor_dlkm"},
 	};
 	auto p = physical.find(bare_name);
-	if (p != physical.end())
+	if (p != physical.end()) {
+		if (is_logical) *is_logical = false;
 		return p->second;
+	}
 	auto l = logical.find(bare_name);
-	if (l != logical.end())
+	if (l != logical.end()) {
+		if (is_logical) *is_logical = true;
 		return l->second;
+	}
 	return "";
 }
 
@@ -532,7 +537,7 @@ bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip
 
 		HighSpeedPartitionPlan entry;
 		entry.name = part.partition_name();
-		entry.target_path = ResolveTargetPath(entry.name);
+		entry.target_path = ResolveTargetPath(entry.name, &entry.is_logical);
 		entry.expanded_size = part.new_partition_info().size();
 		if (entry.target_path.empty()) {
 			LOGERR("high-speed probe: don't know where partition '%s' should be flashed, stopping rather than guess\n",
@@ -715,6 +720,25 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 
 	std::string original_slot = PartitionManager.Get_Active_Slot_Display();
 	std::string target_slot = (original_slot == "A") ? "B" : "A";
+
+	{
+		// lay out every logical partition's final size in ONE pass before
+		// flashing anything -- resizing them one at a time as we reach each
+		// one can starve a later, bigger partition even when the total
+		// would've fit fine with a fresh layout (this is what caused
+		// "Not enough free space to grow 'product_b'" on ROMs with a
+		// bigger product/system_ext than whatever was flashed last)
+		std::string target_suffix = (target_slot == "A") ? "_a" : "_b";
+		std::vector<std::pair<std::string, uint64_t>> logical_sizes;
+		for (auto& part : plan) {
+			if (part.is_logical)
+				logical_sizes.push_back({part.name, part.expanded_size});
+		}
+		if (!PartitionManager.Rebuild_Logical_Group_For_High_Speed_Flash(target_suffix, logical_sizes)) {
+			gui_err("hs_group_rebuild_failed=Couldn't lay out the Super partition group for this ROM. See the log above for details.");
+			return HighSpeedResult::kAborted;
+		}
+	}
 
 	HighSpeedSlotOverride slot_override;
 	slot_override.Enter(target_slot);

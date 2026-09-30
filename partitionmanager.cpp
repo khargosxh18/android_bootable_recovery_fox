@@ -3459,6 +3459,137 @@ bool Ensure_Logical_Partition_Writable(TWPartitionManager* manager, TWPartition*
 	return true;
 }
 
+
+// The high-speed path is a full payload -- it never has to preserve any
+// partition's old size, so instead of growing partitions one at a time
+// (which can starve a later partition even when the total would fit --
+// exactly what happened flashing a ROM with a bigger product.img: odm
+// grew first and left product without enough room, even though the
+// group's total budget was fine) this drops every partition in the
+// group and re-adds them all at once, sized exactly for what's about to
+// be flashed. Same thing update_engine itself does at the start of a
+// normal OTA (see PreparePartitionsForUpdate in its own logs).
+bool TWPartitionManager::Rebuild_Logical_Group_For_High_Speed_Flash(
+		const std::string& slot_suffix,
+		const std::vector<std::pair<std::string, uint64_t>>& partitions) {
+	if (partitions.empty())
+		return true;
+
+	auto snapshots = android::snapshot::SnapshotManager::NewForFirstStageMount();
+	if (snapshots && snapshots->GetUpdateState() != android::snapshot::UpdateState::None) {
+		LOGERR("Refusing to rebuild the logical group while a snapshot update is active\n");
+		gui_err("Logical partitions cannot be resized while an Android snapshot update is active.");
+		return false;
+	}
+
+	const uint32_t metadata_slot = android::fs_mgr::SlotNumberForSlotSuffix(slot_suffix);
+	const std::string super_device = Get_Super_Partition();
+
+	auto builder = MetadataBuilder::New(super_device, metadata_slot);
+	if (!builder) {
+		LOGERR("Unable to read logical partition metadata from '%s'\n", super_device.c_str());
+		gui_err("Unable to read the Super partition metadata.");
+		return false;
+	}
+
+	// every partition we're about to flash should already be in one
+	// group -- find it off the first one that still exists in the
+	// current table
+	std::string group_name;
+	for (auto& kv : partitions) {
+		std::string pname = kv.first + slot_suffix;
+		auto existing = builder->FindPartition(pname);
+		if (existing) {
+			group_name = existing->group_name();
+			break;
+		}
+	}
+	if (group_name.empty()) {
+		LOGERR("Couldn't find which group these partitions belong to\n");
+		gui_err("Unable to determine the Super partition group for this ROM.");
+		return false;
+	}
+
+	auto* group = builder->FindGroup(group_name);
+	if (!group) {
+		LOGERR("Group '%s' not found in metadata\n", group_name.c_str());
+		gui_err("Unable to read the Super partition group metadata.");
+		return false;
+	}
+	uint64_t group_max_size = group->maximum_size();
+
+	// release any of these that happen to be mapped right now -- can't
+	// touch their metadata while they're mapped
+	for (auto& kv : partitions)
+		DestroyLogicalPartition(kv.first + slot_suffix);
+
+	builder->RemoveGroupAndPartitions(group_name);
+	if (!builder->AddGroup(group_name, group_max_size)) {
+		LOGERR("Unable to re-add group '%s'\n", group_name.c_str());
+		gui_err("Unable to rebuild the Super partition group.");
+		return false;
+	}
+
+	uint64_t total_requested = 0;
+	for (auto& kv : partitions)
+		total_requested += kv.second;
+	if (total_requested > group_max_size) {
+		LOGERR("This ROM needs %llu bytes but the group only allows %llu\n",
+			(unsigned long long)total_requested, (unsigned long long)group_max_size);
+		gui_err("This ROM's partitions don't fit in the Super group even with a fresh layout -- it's genuinely too big for this device.");
+		return false;
+	}
+
+	for (auto& kv : partitions) {
+		std::string pname = kv.first + slot_suffix;
+		Partition* p = builder->AddPartition(pname, group_name, 0 /* LP_PARTITION_ATTR_NONE */);
+		if (!p || !builder->ResizePartition(p, kv.second)) {
+			LOGERR("Unable to add/size partition '%s' at %llu bytes\n",
+				pname.c_str(), (unsigned long long)kv.second);
+			gui_err(("Unable to lay out '" + kv.first + "' in the rebuilt Super group.").c_str());
+			return false;
+		}
+	}
+
+	auto updated = builder->Export();
+	if (!updated) {
+		gui_err("Unable to prepare the rebuilt Super partition metadata.");
+		return false;
+	}
+	if (!android::fs_mgr::UpdatePartitionTable(super_device, *updated, metadata_slot)) {
+		LOGERR("Failed to commit the rebuilt Super partition table\n");
+		gui_err("Unable to write the rebuilt Super partition metadata.");
+		return false;
+	}
+
+	for (auto& kv : partitions) {
+		std::string pname = kv.first + slot_suffix;
+		android::fs_mgr::CreateLogicalPartitionParams params = {
+			.block_device = super_device,
+			.metadata_slot = metadata_slot,
+			.partition_name = pname,
+			.force_writable = true,
+			.timeout_ms = std::chrono::seconds(5),
+		};
+		std::string mapped_path;
+		if (!android::fs_mgr::CreateLogicalPartition(params, &mapped_path)) {
+			LOGERR("Unable to map '%s' after rebuild\n", pname.c_str());
+			gui_err(("Unable to map '" + kv.first + "' after rebuilding the Super group.").c_str());
+			return false;
+		}
+		TWPartition* twp = PartitionManager.Find_Partition_By_Path("/" + kv.first);
+		if (twp) {
+			twp->Set_Block_Device(mapped_path);
+			twp->Update_Size(true);
+		}
+	}
+
+	LOGINFO("rebuilt logical group '%s' for %zu partitions, total %llu of %llu bytes\n",
+		group_name.c_str(), partitions.size(),
+		(unsigned long long)total_requested, (unsigned long long)group_max_size);
+	return true;
+}
+
 bool TWPartitionManager::Flash_Image(string& path, string& filename) {
 	twrpRepacker repacker;
 	int partition_count = 0;
