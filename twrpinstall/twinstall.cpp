@@ -880,6 +880,7 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	const char* dumper_args[] = {
 		kHighSpeedDumperPath,
 		"-c", "8",
+		"-q", // Silence payload-dumper-go's terminal animation spam
 		"-p", joined_names.c_str(),
 		"-o", kHighSpeedLinkDir,
 		package.c_str(),
@@ -889,15 +890,6 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	int status = 0;
 	pid_t pid = fork();
 	if (pid == 0) {
-		// silence the dumper's normal progress output, but leave stderr
-		// alone -- it inherits recovery's own stderr, which goes to
-		// recovery.log, so if the dumper crashes or hits a fatal error we
-		// actually see why instead of just getting a bare nonzero exit code
-		int null_fd = open("/dev/null", O_WRONLY);
-		if (null_fd != -1) {
-			dup2(null_fd, STDOUT_FILENO);
-			close(null_fd);
-		}
 		execv(dumper_args[0], const_cast<char**>(dumper_args));
 		_exit(127);
 	} else if (pid < 0) {
