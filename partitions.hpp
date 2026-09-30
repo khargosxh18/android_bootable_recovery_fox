@@ -423,6 +423,7 @@ public:
 	bool Flash_Image(string& path, string& filename);                         // Flashes an image to a selected partition from the partition list
 	bool Rebuild_Logical_Group_For_High_Speed_Flash(const std::string& slot_suffix,
 		const std::vector<std::pair<std::string, uint64_t>>& partitions,
+		const std::string& declared_group_name, uint64_t declared_group_size,
 		std::map<std::string, std::string>* mapped_paths = nullptr);       // rebuilds a Super group in one pass for a full-payload high-speed flash, avoiding the sequential-resize starvation problem
 	bool Flash_Repacked_Image(string& path, string& filename, bool recovery); // Reflash repacked image...
 	

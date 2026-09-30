@@ -348,6 +348,14 @@ struct HighSpeedPartitionPlan {
 	bool is_logical = false;   // true if this one lives in Super (needs the group rebuild)
 };
 
+// the dynamic-partition group the payload's manifest puts the logical
+// partitions in. name is bare (no slot suffix), size is the budget the ROM
+// was built for. empty/0 means the manifest didn't say.
+struct HighSpeedGroupSpec {
+	std::string name;
+	uint64_t size = 0;
+};
+
 uint64_t ReadBigEndian64(const uint8_t* p) {
 	uint64_t v = 0;
 	for (int i = 0; i < 8; i++)
@@ -471,6 +479,7 @@ bool ResolvePhysicalTarget(const HighSpeedPartitionPlan& part, const std::string
 		LOGERR("high-speed: no block device known for '%s'\n", part.name.c_str());
 		return false;
 	}
+	LOGINFO("high-speed: '%s' primary block device is '%s'\n", part.name.c_str(), base.c_str());
 	auto ends_with = [&](const char* suf) {
 		return base.size() > 2 && base.compare(base.size() - 2, 2, suf) == 0;
 	};
@@ -534,8 +543,10 @@ bool OpTypeIsSupported(chromeos_update_engine::InstallOperation::Type type) {
 // manifest, so we know which partitions exist and whether anything in
 // there is a format we can't handle -- before touching disk at all
 bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip,
-                            std::vector<HighSpeedPartitionPlan>* plan) {
+                            std::vector<HighSpeedPartitionPlan>* plan,
+                            HighSpeedGroupSpec* group_spec) {
 	plan->clear();
+	*group_spec = HighSpeedGroupSpec();
 
 	ZipEntry64 payload_entry;
 	if (FindEntry(zip, "payload.bin", &payload_entry) != 0) {
@@ -665,7 +676,59 @@ bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip
 		plan->push_back(std::move(entry));
 	}
 
-	return !plan->empty();
+	if (plan->empty())
+		return false;
+
+	// which Super group does the payload say the logical partitions live
+	// in, and how big is its budget? all of them must be in ONE group --
+	// the rebuild handles exactly one, so anything else stops here, before
+	// anything on the device is touched
+	bool any_logical = false;
+	for (const auto& entry : *plan)
+		any_logical = any_logical || entry.is_logical;
+	if (any_logical) {
+		if (!manifest.has_dynamic_partition_metadata()) {
+			LOGINFO("high-speed probe: payload has no dynamic partition metadata, keeping the device's current group size\n");
+		} else {
+			const chromeos_update_engine::DynamicPartitionGroup* chosen = nullptr;
+			for (const auto& entry : *plan) {
+				if (!entry.is_logical)
+					continue;
+				const chromeos_update_engine::DynamicPartitionGroup* owner = nullptr;
+				for (const auto& g : manifest.dynamic_partition_metadata().groups()) {
+					for (const auto& n : g.partition_names()) {
+						if (n != entry.name)
+							continue;
+						if (owner && owner != &g) {
+							LOGERR("high-speed probe: partition '%s' is listed in more than one group\n",
+								entry.name.c_str());
+							return false;
+						}
+						owner = &g;
+					}
+				}
+				if (!owner) {
+					LOGERR("high-speed probe: logical partition '%s' isn't listed in any dynamic partition group\n",
+						entry.name.c_str());
+					return false;
+				}
+				if (chosen && chosen != owner) {
+					LOGERR("high-speed probe: the logical partitions span more than one group ('%s' and '%s'), not supported\n",
+						chosen->name().c_str(), owner->name().c_str());
+					return false;
+				}
+				chosen = owner;
+			}
+			if (chosen) {
+				group_spec->name = chosen->name();
+				group_spec->size = chosen->size();
+				LOGINFO("high-speed probe: payload declares group '%s' with size %llu\n",
+					group_spec->name.c_str(), (unsigned long long)group_spec->size);
+			}
+		}
+	}
+
+	return true;
 }
 
 }  // namespace
@@ -701,8 +764,9 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 
 	gui_print("High-speed flash: reading the payload...\n");
 	std::vector<HighSpeedPartitionPlan> plan;
-	if (!ProbeHighSpeedPayload(package, zip, &plan)) {
-		gui_err("hs_probe_failed=This package doesn't work with high-speed flash (delta payload or an operation type we can't decode). Turn off high-speed flash for this package and try again.");
+	HighSpeedGroupSpec group_spec;
+	if (!ProbeHighSpeedPayload(package, zip, &plan, &group_spec)) {
+		gui_err("hs_probe_failed=This package doesn't work with high-speed flash (delta payload, an operation type we can't decode, or inconsistent Super group info). Turn off high-speed flash for this package and try again.");
 		return HighSpeedResult::kAborted;
 	}
 
@@ -817,7 +881,8 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 		}
 		if (!logical_sizes.empty())
 			gui_print("High-speed flash: laying out the Super partitions for slot %s...\n", target_slot.c_str());
-		if (!PartitionManager.Rebuild_Logical_Group_For_High_Speed_Flash(target_suffix, logical_sizes, &mapped_paths)) {
+		if (!PartitionManager.Rebuild_Logical_Group_For_High_Speed_Flash(target_suffix, logical_sizes,
+			group_spec.name, group_spec.size, &mapped_paths)) {
 			gui_err(("hs_group_rebuild_failed=Couldn't lay out the Super partition group for this ROM. The slot you booted from wasn't touched and the active slot wasn't changed; slot " +
 				target_slot + " may be incomplete. See the log above for details.").c_str());
 			return HighSpeedResult::kAborted;
@@ -831,7 +896,7 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 		auto it = mapped_paths.find(part.name);
 		if (it == mapped_paths.end()) {
 			LOGERR("high-speed: no mapped node was returned for '%s'\n", part.name.c_str());
-			gui_err(("hs_map_missing='" + part.name + "' wasn't mapped after the Super layout. Nothing has been extracted; the active slot wasn't changed.").c_str());
+			gui_err(("hs_map_missing=The partition '" + part.name + "' wasn't mapped after the Super layout. Nothing has been extracted; the active slot wasn't changed.").c_str());
 			return HighSpeedResult::kAborted;
 		}
 		std::string node;
