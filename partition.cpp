@@ -3912,6 +3912,10 @@ void TWPartition::Set_Block_Device(std::string block_device) {
 	Primary_Block_Device = Actual_Block_Device = block_device;
 }
 
+std::string TWPartition::Get_Primary_Block_Device() {
+	return Primary_Block_Device;
+}
+
 std::string TWPartition::Get_Backup_FileName() {
 	return Backup_FileName;
 }

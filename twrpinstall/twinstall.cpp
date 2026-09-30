@@ -44,6 +44,11 @@
 #include <map>
 #include <set>
 #include <sys/statvfs.h>
+#include <sys/ioctl.h>
+#include <linux/fs.h>
+#include <dirent.h>
+#include <algorithm>
+#include <android-base/properties.h>
 #include <update_engine/update_metadata.pb.h>
 
 #include "twcommon.h"
@@ -292,11 +297,15 @@ static int Run_Update_Binary(const char *path, int* wipe_cache, zip_type ztype) 
 //
 // The normal AB install path hands the payload to update_engine, which
 // decompresses and hashes every operation one at a time on a single
-// thread -- that's the slow part, not the disk write. This path pulls the
-// partitions out in parallel with payload-dumper-go first, then flashes
-// the finished images through the same Flash_Image() code manual image
-// flashing already uses, and finally flips the active slot by hand since
-// update_engine never ran to do it for us.
+// thread -- that's the slow part, not the disk write. This path instead
+// lets payload-dumper-go decode the partitions in parallel and write them
+// DIRECTLY into the target slot's block nodes: the dumper's output
+// directory is a small farm of symlinks (<name>.img -> real block node),
+// so extraction is the flash, there is no scratch copy on /data and no
+// second write pass. Because the nodes must already exist at their final
+// size, the Super group for the target slot is rebuilt BEFORE extraction.
+// Finally the active slot is flipped by hand since update_engine never ran
+// to do it for us.
 //
 // This only ever runs when the user explicitly turned it on for this zip,
 // and it only ever touches system/vendor/product/boot-type partitions --
@@ -311,12 +320,9 @@ static int Run_Update_Binary(const char *path, int* wipe_cache, zip_type ztype) 
 namespace {
 
 const char* kHighSpeedDumperPath = "/system/bin/payload-dumper-static";
-const char* kHighSpeedScratchDir = "/data/hsf_extract";
-
-// how much extra free space to require on top of what the partitions
-// actually need, so extraction doesn't run /data down to zero -- 5% or
-// 256MB, whichever is bigger
-const uint64_t kHighSpeedStorageMarginMin = 256ULL * 1024 * 1024;
+// directory of symlinks handed to the dumper as its output dir. lives on
+// the recovery ramdisk (tmpfs), holds only tiny symlinks, never real data
+const char* kHighSpeedLinkDir = "/tmp/hsf_links";
 
 const size_t kPayloadMagicSize = 4;
 const size_t kPayloadVersionSize = 8;
@@ -395,6 +401,118 @@ bool ReflashSelfToOtherSlot(const std::string& source_slot, const std::string& t
 	LOGINFO("high-speed: copied OrangeFox onto the other slot's recovery ('%s' -> '%s')\n",
 		source_path.c_str(), target_path.c_str());
 	return true;
+}
+
+// which slot recovery itself booted from -- that slot must never be
+// written. ro.boot.slot_suffix is authoritative (the slot menu can change
+// the *bootloader's* active slot without changing what we booted from);
+// fall back to the manager's notion of the active slot only if the
+// property is missing. returns "A", "B", or "" if it can't be known.
+std::string DetermineBootedSlot() {
+	std::string prop = android::base::GetProperty("ro.boot.slot_suffix", "");
+	std::string display = PartitionManager.Get_Active_Slot_Display();
+	if (prop == "_a" || prop == "_b") {
+		std::string from_prop = (prop == "_a") ? "A" : "B";
+		if (!display.empty() && display != from_prop)
+			LOGINFO("high-speed: active slot display is '%s' but recovery booted from '%s' -- treating '%s' as the booted slot\n",
+				display.c_str(), from_prop.c_str(), from_prop.c_str());
+		return from_prop;
+	}
+	if (display == "A" || display == "B")
+		return display;
+	return "";
+}
+
+// resolves symlinks and only succeeds if the final target is a block device
+bool ResolveBlockNode(const std::string& path, std::string* real) {
+	char buf[PATH_MAX];
+	if (realpath(path.c_str(), buf) == nullptr)
+		return false;
+	struct stat st;
+	if (stat(buf, &st) != 0 || !S_ISBLK(st.st_mode))
+		return false;
+	*real = buf;
+	return true;
+}
+
+bool GetBlockDeviceSize(const std::string& path, uint64_t* size) {
+	android::base::unique_fd fd(open(path.c_str(), O_RDONLY | O_CLOEXEC));
+	if (fd == -1)
+		return false;
+	uint64_t bytes = 0;
+	if (ioctl(fd.get(), BLKGETSIZE64, &bytes) != 0)
+		return false;
+	*size = bytes;
+	return true;
+}
+
+// works out the exact node a physical (boot/dtbo/vbmeta...) partition
+// must be written to on the TARGET slot, without touching any global slot
+// state. Primary_Block_Device is the bare fstab path, so appending the
+// target suffix gives the node directly (same pattern as
+// ReflashSelfToOtherSlot). refuses anything that isn't a real block
+// device, and refuses if it would resolve to the booted slot's node.
+bool ResolvePhysicalTarget(const HighSpeedPartitionPlan& part, const std::string& booted_suffix,
+                           const std::string& target_suffix, std::string* node) {
+	std::string base;
+	TWPartition* twp = PartitionManager.Find_Partition_By_Path(part.target_path);
+	if (twp) {
+		if (!twp->Is_SlotSelect()) {
+			LOGERR("high-speed: '%s' is not a slot-select partition here, refusing to guess its target\n",
+				part.name.c_str());
+			return false;
+		}
+		base = twp->Get_Primary_Block_Device();
+	} else {
+		base = "/dev/block/bootdevice/by-name/" + part.name;
+		LOGINFO("high-speed: '%s' isn't in the fstab, using the by-name path\n", part.name.c_str());
+	}
+	if (base.empty()) {
+		LOGERR("high-speed: no block device known for '%s'\n", part.name.c_str());
+		return false;
+	}
+	auto ends_with = [&](const char* suf) {
+		return base.size() > 2 && base.compare(base.size() - 2, 2, suf) == 0;
+	};
+	if (ends_with("_a") || ends_with("_b")) {
+		LOGERR("high-speed: '%s' already looks slot-suffixed ('%s'), refusing to guess\n",
+			part.name.c_str(), base.c_str());
+		return false;
+	}
+
+	std::string target_real;
+	if (!ResolveBlockNode(base + target_suffix, &target_real)) {
+		LOGERR("high-speed: target node '%s%s' is missing or not a block device\n",
+			base.c_str(), target_suffix.c_str());
+		return false;
+	}
+	std::string booted_real;
+	if (ResolveBlockNode(base + booted_suffix, &booted_real) && booted_real == target_real) {
+		LOGERR("high-speed: target node for '%s' resolves to the booted slot's node, refusing\n",
+			part.name.c_str());
+		return false;
+	}
+	*node = target_real;
+	LOGINFO("high-speed: '%s' -> '%s%s' (%s)\n", part.name.c_str(), base.c_str(),
+		target_suffix.c_str(), target_real.c_str());
+	return true;
+}
+
+// empties and removes the symlink farm. unlinkat() on a symlink removes
+// the link itself and never follows it, so this can't reach a block node.
+void RemoveHighSpeedLinkFarm() {
+	DIR* d = opendir(kHighSpeedLinkDir);
+	if (d) {
+		int dfd = dirfd(d);
+		struct dirent* e;
+		while ((e = readdir(d)) != nullptr) {
+			if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+				continue;
+			unlinkat(dfd, e->d_name, 0);
+		}
+		closedir(d);
+	}
+	rmdir(kHighSpeedLinkDir);
 }
 
 // payload-dumper-go can't decode these op types yet, so we check for them
@@ -558,34 +676,11 @@ enum class HighSpeedResult {
 	kSucceeded,
 };
 
-// deletes the scratch extraction folder whenever this goes out of scope,
-// win or lose, so a multi-gigabyte pile of extracted images never sits
-// around on /data after the install finishes or fails
-struct HighSpeedScratchGuard {
-	~HighSpeedScratchGuard() { TWFunc::removeDir(kHighSpeedScratchDir, false); }
-};
-
-// Flash_Image() writes to whatever slot is currently "active" as far as
-// TWPartitionManager is concerned, and that's the slot recovery itself
-// booted from. We need to write the *other* slot, so this overrides which
-// slot Flash_Image() targets for as long as we're flashing, and always
-// puts it back afterward -- including if something throws or we return
-// early, since it cleans up in its destructor either way.
-struct HighSpeedSlotOverride {
-	std::string original;
-	bool active = false;
-	void Enter(const std::string& target) {
-		original = PartitionManager.Get_Active_Slot_Display();
-		PartitionManager.Override_Active_Slot(target);
-		active = true;
-	}
-	void Restore() {
-		if (!active)
-			return;
-		PartitionManager.Override_Active_Slot(original);
-		active = false;
-	}
-	~HighSpeedSlotOverride() { Restore(); }
+// removes the symlink farm whenever this goes out of scope, win or lose.
+// only tiny symlinks ever live there -- the real data goes straight to
+// the block nodes, so there is nothing big to clean up on /data anymore.
+struct HighSpeedLinkFarmGuard {
+	~HighSpeedLinkFarmGuard() { RemoveHighSpeedLinkFarm(); }
 };
 
 HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHandle zip) {
@@ -611,6 +706,68 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 		return HighSpeedResult::kAborted;
 	}
 
+	// ---- which slot are we allowed to write? -------------------------
+	// the slot recovery booted from is never written. if we can't tell
+	// which one that is, stop before touching anything.
+	const std::string booted_slot = DetermineBootedSlot();
+	if (booted_slot.empty()) {
+		gui_err("hs_slot_unknown=Couldn't tell which slot is currently booted, so high-speed flash can't pick a safe target. Stopping.");
+		return HighSpeedResult::kAborted;
+	}
+	const std::string target_slot = (booted_slot == "A") ? "B" : "A";
+	const std::string booted_suffix = (booted_slot == "A") ? "_a" : "_b";
+	const std::string target_suffix = (target_slot == "A") ? "_a" : "_b";
+	LOGINFO("high-speed: booted slot %s, writing slot %s\n", booted_slot.c_str(), target_slot.c_str());
+
+	// no partition may appear twice in the plan
+	{
+		std::set<std::string> seen_names;
+		for (auto& part : plan) {
+			if (!seen_names.insert(part.name).second) {
+				LOGERR("high-speed: partition '%s' appears twice in the payload\n", part.name.c_str());
+				gui_err("hs_duplicate_part=The payload lists the same partition twice. Stopping before anything is written.");
+				return HighSpeedResult::kAborted;
+			}
+		}
+	}
+
+	// ---- pre-flight, BEFORE anything destructive ---------------------
+	// resolve and validate every physical target (exists, is a block
+	// device, isn't the booted slot's node, big enough for the image).
+	// nothing has been modified at this point, so any failure here is free.
+	std::map<std::string, std::string> nodes;  // partition name -> real block node
+	std::set<std::string> seen_nodes;
+	for (auto& part : plan) {
+		if (part.is_logical)
+			continue;
+		std::string node;
+		if (!ResolvePhysicalTarget(part, booted_suffix, target_suffix, &node)) {
+			gui_err(("hs_target_invalid=Couldn't find a safe target for '" + part.name +
+				"' on slot " + target_slot + ". Nothing was written. See the log for details.").c_str());
+			return HighSpeedResult::kAborted;
+		}
+		uint64_t node_size = 0;
+		if (!GetBlockDeviceSize(node, &node_size)) {
+			LOGERR("high-speed: couldn't read the size of '%s'\n", node.c_str());
+			gui_err(("hs_target_size_unknown=Couldn't read the size of the target for '" + part.name +
+				"'. Nothing was written.").c_str());
+			return HighSpeedResult::kAborted;
+		}
+		if (node_size < part.expanded_size) {
+			LOGERR("high-speed: image for '%s' is %llu bytes but the target node is only %llu\n",
+				part.name.c_str(), (unsigned long long)part.expanded_size, (unsigned long long)node_size);
+			gui_err(("hs_target_too_small=The image for '" + part.name +
+				"' is bigger than its partition on slot " + target_slot + ". Nothing was written.").c_str());
+			return HighSpeedResult::kAborted;
+		}
+		if (!seen_nodes.insert(node).second) {
+			LOGERR("high-speed: two partitions resolve to the same node '%s'\n", node.c_str());
+			gui_err("hs_target_collision=Two partitions resolved to the same target. Nothing was written.");
+			return HighSpeedResult::kAborted;
+		}
+		nodes[part.name] = node;
+	}
+
 	// if a normal install got interrupted before, libsnapshot can leave
 	// state behind here that makes Ensure_Logical_Partition_Writable's
 	// "is an update in progress" check refuse to touch anything -- clear
@@ -619,64 +776,103 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	if (TWFunc::Path_Exists("/metadata/ota"))
 		TWFunc::removeDir("/metadata/ota", false);
 
-	// only bother cleaning up if something's actually there -- removeDir
-	// on a path that doesn't exist yet just prints a scary-looking "no
-	// such file" line for no reason
-	if (access(kHighSpeedScratchDir, F_OK) == 0)
-		TWFunc::removeDir(kHighSpeedScratchDir, false);
-	if (mkdir(kHighSpeedScratchDir, 0700) != 0 && errno != EEXIST) {
-		gui_err("hs_scratch_mkdir_failed=Couldn't create the scratch folder for high-speed extraction.");
+	// fresh, empty symlink farm for the dumper's output dir
+	RemoveHighSpeedLinkFarm();
+	if (mkdir(kHighSpeedLinkDir, 0700) != 0) {
+		LOGERR("high-speed: couldn't create '%s' (%s)\n", kHighSpeedLinkDir, strerror(errno));
+		gui_err("hs_scratch_mkdir_failed=Couldn't create the link folder for high-speed extraction. Nothing was written.");
 		return HighSpeedResult::kAborted;
 	}
-	HighSpeedScratchGuard scratch_guard;
+	HighSpeedLinkFarmGuard farm_guard;
 
-	uint64_t required_bytes = 0;
-	std::vector<std::string> names;
+	// pass the dumper the biggest partitions first -- it starts them in
+	// the order we give it, and the biggest one decides how long the
+	// whole extraction takes, so it shouldn't sit queued behind small ones
+	std::string joined_names;
 	{
-		// pass the dumper the biggest partitions first -- it starts them
-		// in the order we give it, and the biggest one is what decides
-		// how long the whole extraction takes, so it shouldn't be sitting
-		// queued behind a bunch of small ones
 		std::vector<const HighSpeedPartitionPlan*> by_size;
-		for (auto& part : plan) {
-			required_bytes += part.expanded_size;
+		for (auto& part : plan)
 			by_size.push_back(&part);
-		}
 		std::stable_sort(by_size.begin(), by_size.end(),
 			[](const HighSpeedPartitionPlan* a, const HighSpeedPartitionPlan* b) {
 				return a->expanded_size > b->expanded_size;
 			});
-		for (auto* part : by_size)
-			names.push_back(part->name);
+		for (size_t i = 0; i < by_size.size(); i++) {
+			if (i > 0)
+				joined_names += ",";
+			joined_names += by_size[i]->name;
+		}
 	}
 
-	uint64_t margin = std::max<uint64_t>(kHighSpeedStorageMarginMin, required_bytes / 20);
-	uint64_t needed_bytes = required_bytes + margin;
-
-	struct statvfs vfs {};
-	if (statvfs(kHighSpeedScratchDir, &vfs) != 0) {
-		gui_err("hs_statvfs_failed=Couldn't check free space for high-speed flash. Stopping.");
-		return HighSpeedResult::kAborted;
-	}
-	uint64_t available_bytes = (uint64_t)vfs.f_bavail * (uint64_t)vfs.f_frsize;
-	if (available_bytes < needed_bytes) {
-		char msg[256];
-		snprintf(msg, sizeof(msg),
-			"hs_low_storage=Not enough free space for high-speed flash: need about %llu MB, only %llu MB free. Free up space or turn off high-speed flash.",
-			(unsigned long long)(needed_bytes / (1024 * 1024)),
-			(unsigned long long)(available_bytes / (1024 * 1024)));
-		gui_err(msg);
-		return HighSpeedResult::kAborted;
-	}
-
-	std::string joined_names;
-	for (size_t i = 0; i < names.size(); i++) {
-		if (i > 0)
-			joined_names += ",";
-		joined_names += names[i];
+	// ---- first destructive step: lay out the target slot's Super group
+	// in ONE pass, at final sizes, so the dm nodes exist at the right size
+	// before the dumper opens them. this only rewrites the TARGET slot's
+	// metadata; the booted slot's partitions are never touched.
+	std::map<std::string, std::string> mapped_paths;
+	{
+		std::vector<std::pair<std::string, uint64_t>> logical_sizes;
+		for (auto& part : plan) {
+			if (part.is_logical)
+				logical_sizes.push_back({part.name, part.expanded_size});
+		}
+		if (!logical_sizes.empty())
+			gui_print("High-speed flash: laying out the Super partitions for slot %s...\n", target_slot.c_str());
+		if (!PartitionManager.Rebuild_Logical_Group_For_High_Speed_Flash(target_suffix, logical_sizes, &mapped_paths)) {
+			gui_err(("hs_group_rebuild_failed=Couldn't lay out the Super partition group for this ROM. The slot you booted from wasn't touched and the active slot wasn't changed; slot " +
+				target_slot + " may be incomplete. See the log above for details.").c_str());
+			return HighSpeedResult::kAborted;
+		}
 	}
 
-	gui_print("High-speed flash: extracting partitions, this takes some seconds...\n");
+	// validate every logical node the rebuild just mapped
+	for (auto& part : plan) {
+		if (!part.is_logical)
+			continue;
+		auto it = mapped_paths.find(part.name);
+		if (it == mapped_paths.end()) {
+			LOGERR("high-speed: no mapped node was returned for '%s'\n", part.name.c_str());
+			gui_err(("hs_map_missing='" + part.name + "' wasn't mapped after the Super layout. Nothing has been extracted; the active slot wasn't changed.").c_str());
+			return HighSpeedResult::kAborted;
+		}
+		std::string node;
+		if (!ResolveBlockNode(it->second, &node)) {
+			LOGERR("high-speed: mapped path '%s' for '%s' isn't a block device\n",
+				it->second.c_str(), part.name.c_str());
+			gui_err(("hs_map_invalid=The mapped target for '" + part.name +
+				"' isn't a valid block device. Nothing has been extracted; the active slot wasn't changed.").c_str());
+			return HighSpeedResult::kAborted;
+		}
+		uint64_t node_size = 0;
+		if (!GetBlockDeviceSize(node, &node_size) || node_size < part.expanded_size) {
+			LOGERR("high-speed: mapped node '%s' for '%s' is %llu bytes, need %llu\n",
+				node.c_str(), part.name.c_str(), (unsigned long long)node_size,
+				(unsigned long long)part.expanded_size);
+			gui_err(("hs_map_too_small=The mapped target for '" + part.name +
+				"' is smaller than its image. Nothing has been extracted; the active slot wasn't changed.").c_str());
+			return HighSpeedResult::kAborted;
+		}
+		if (!seen_nodes.insert(node).second) {
+			LOGERR("high-speed: mapped node '%s' collides with another target\n", node.c_str());
+			gui_err("hs_target_collision=Two partitions resolved to the same target. Nothing has been extracted; the active slot wasn't changed.");
+			return HighSpeedResult::kAborted;
+		}
+		nodes[part.name] = node;
+	}
+
+	// build the farm: <name>.img -> real block node. every node was
+	// verified above as an existing block device, so the dumper's open()
+	// can never fall into creating a regular file under /dev/block
+	for (auto& part : plan) {
+		std::string link = std::string(kHighSpeedLinkDir) + "/" + part.name + ".img";
+		if (symlink(nodes[part.name].c_str(), link.c_str()) != 0) {
+			LOGERR("high-speed: couldn't link '%s' -> '%s' (%s)\n", link.c_str(),
+				nodes[part.name].c_str(), strerror(errno));
+			gui_err("hs_link_failed=Couldn't set up the extraction targets. Nothing has been extracted; the active slot wasn't changed.");
+			return HighSpeedResult::kAborted;
+		}
+	}
+
+	gui_print("High-speed flash: writing partitions straight to slot %s, this takes some seconds...\n", target_slot.c_str());
 
 	time_t extract_start, extract_stop;
 	time(&extract_start);
@@ -685,7 +881,7 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 		kHighSpeedDumperPath,
 		"-c", "8",
 		"-p", joined_names.c_str(),
-		"-o", kHighSpeedScratchDir,
+		"-o", kHighSpeedLinkDir,
 		package.c_str(),
 		nullptr
 	};
@@ -705,72 +901,41 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 		execv(dumper_args[0], const_cast<char**>(dumper_args));
 		_exit(127);
 	} else if (pid < 0) {
-		gui_err("hs_dumper_launch_failed=Couldn't start the high-speed extractor. Stopping.");
+		gui_err("hs_dumper_launch_failed=Couldn't start the high-speed extractor. Nothing was written; the active slot wasn't changed.");
 		return HighSpeedResult::kAborted;
 	}
-	waitpid(pid, &status, 0);
-	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-		gui_err("hs_extraction_failed=High-speed extraction failed, or a checksum didn't match. No partitions were touched.");
+	pid_t waited;
+	do {
+		waited = waitpid(pid, &status, 0);
+	} while (waited < 0 && errno == EINTR);
+	if (waited != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+		LOGERR("high-speed: dumper failed (wait=%d status=0x%x)\n", (int)waited, status);
+		gui_err(("hs_extraction_failed=High-speed extraction failed, or a checksum didn't match. The slot you booted from wasn't touched and the active slot wasn't changed, but slot " +
+			target_slot + " is now incomplete. You Can Either Flash Using Normal Method, Or Reboot To Previous System Normally.").c_str());
 		return HighSpeedResult::kAborted;
 	}
 
-	time(&extract_stop);
-	int extract_secs = (int) difftime(extract_stop, extract_start);
-	gui_print("High-speed flash: extraction done in %ds, flashing the inactive slot...\n", extract_secs);
-
-	std::string original_slot = PartitionManager.Get_Active_Slot_Display();
-	std::string target_slot = (original_slot == "A") ? "B" : "A";
-
-	{
-		// lay out every logical partition's final size in ONE pass before
-		// flashing anything -- resizing them one at a time as we reach each
-		// one can starve a later, bigger partition even when the total
-		// would've fit fine with a fresh layout (this is what caused
-		// "Not enough free space to grow 'product_b'" on ROMs with a
-		// bigger product/system_ext than whatever was flashed last)
-		std::string target_suffix = (target_slot == "A") ? "_a" : "_b";
-		std::vector<std::pair<std::string, uint64_t>> logical_sizes;
-		for (auto& part : plan) {
-			if (part.is_logical)
-				logical_sizes.push_back({part.name, part.expanded_size});
-		}
-		if (!PartitionManager.Rebuild_Logical_Group_For_High_Speed_Flash(target_suffix, logical_sizes)) {
-			gui_err("hs_group_rebuild_failed=Couldn't lay out the Super partition group for this ROM. See the log above for details.");
+	// the dumper writes through the page cache and doesn't fsync device
+	// nodes. flush every target explicitly, then a global sync, and only
+	// call it success if every flush went through.
+	gui_print("High-speed flash: flushing writes to storage...\n");
+	for (auto& kv : nodes) {
+		android::base::unique_fd fd(open(kv.second.c_str(), O_RDONLY | O_CLOEXEC));
+		if (fd == -1 || fsync(fd.get()) != 0) {
+			LOGERR("high-speed: couldn't flush '%s' (%s)\n", kv.second.c_str(), strerror(errno));
+			gui_err(("hs_flush_failed=Couldn't confirm that '" + kv.first +
+				"' was fully written to storage. The active slot wasn't changed; slot " + target_slot +
+				" should not be booted.").c_str());
 			return HighSpeedResult::kAborted;
 		}
 	}
+	sync();
 
-	HighSpeedSlotOverride slot_override;
-	slot_override.Enter(target_slot);
+	time(&extract_stop);
+	int extract_secs = (int) difftime(extract_stop, extract_start);
+	gui_print("High-speed flash: slot %s written and flushed in %ds.\n", target_slot.c_str(), extract_secs);
 
-	// Flash_Image(directory, filename) doesn't take the target partition
-	// as an argument -- it reads it from tw_flash_partition, the same way
-	// the normal manual "flash image" screen sets it up
-	DataManager::SetValue("tw_flash_both_slots", 0);
-	bool flash_ok = true;
-	std::string failed_part;
-	for (auto& part : plan) {
-		std::string directory = kHighSpeedScratchDir;
-		std::string filename = part.name + ".img";
-		DataManager::SetValue("tw_flash_partition", part.target_path + ";");
-		DataManager::SetValue("tw_partition", part.target_path);
-		if (!PartitionManager.Flash_Image(directory, filename)) {
-			flash_ok = false;
-			failed_part = part.name;
-			break;
-		}
-	}
-	DataManager::SetValue("tw_flash_partition", "");
-	slot_override.Restore();  // back to the booted slot before we touch the bootloader's active-slot setting
-
-	if (!flash_ok) {
-		gui_err(("hs_flash_failed=High-speed flash failed writing '" + failed_part +
-			"'. The slot you booted from wasn't touched and the active slot wasn't changed, "
-			"You Can Either Flash Using Normal Method, Or Reboot To Previous System Normally.").c_str());
-		return HighSpeedResult::kAborted;
-	}
-
-	if (!ReflashSelfToOtherSlot(original_slot, target_slot))
+	if (!ReflashSelfToOtherSlot(booted_slot, target_slot))
 		gui_warn("hs_recovery_copy_failed=High-speed flash: couldn't copy OrangeFox onto the other slot's recovery. "
 		         "You may need to flash it there manually before switching to that slot.");
 
@@ -779,7 +944,7 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	// ourselves, and only now that every partition has actually succeeded
 	PartitionManager.Set_Active_Slot(target_slot);
 	if (PartitionManager.Get_Active_Slot_Display() != target_slot) {
-		gui_err(("hs_slot_switch_failed=Every partition was written and verified, but switching to slot " + target_slot +
+		gui_err(("hs_slot_switch_failed=Every partition was written and flushed, but switching to slot " + target_slot +
 			" didn't take. Switch to it manually from the slot menu before rebooting.").c_str());
 		return HighSpeedResult::kAborted;
 	}
@@ -790,7 +955,7 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 		gui_warn("mount_vab_partitions=Devices on super may not mount until after rebooting recovery.");
 	}
 
-        gui_print("1 min flash is cool right, it's done (^-^), now reboot to recovery again\n\n");
+	gui_print("1 min flash is cool right, it's done (^-^), now reboot to recovery again\n\n");
 	return HighSpeedResult::kSucceeded;
 }
 // ---------------------------------------------------------------------
