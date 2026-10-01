@@ -649,6 +649,16 @@ bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip
 		return false;
 	}
 
+	// the payload itself says which partitions live in Super (any group's
+	// partition_names). that's authoritative, so ROM-specific logical
+	// partitions (mi_ext, odm_dlkm, ...) don't each need a hard-coded entry
+	std::set<std::string> logical_names;
+	if (manifest.has_dynamic_partition_metadata()) {
+		for (const auto& g : manifest.dynamic_partition_metadata().groups())
+			for (const auto& n : g.partition_names())
+				logical_names.insert(n);
+	}
+
 	for (const auto& part : manifest.partitions()) {
 		if (HighSpeedExcludedPartitions().count(part.partition_name())) {
 			LOGINFO("high-speed probe: skipping firmware partition '%s', flash it separately\n",
@@ -667,6 +677,18 @@ bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip
 		HighSpeedPartitionPlan entry;
 		entry.name = part.partition_name();
 		entry.target_path = ResolveTargetPath(entry.name, &entry.is_logical);
+		if (entry.target_path.empty() && logical_names.count(entry.name)) {
+			// a Super partition that isn't in the hard-coded table
+			entry.target_path = "/" + entry.name;
+			entry.is_logical = true;
+			LOGINFO("high-speed probe: '%s' isn't in the built-in table, but the payload lists it in a Super group -- treating it as a logical partition\n",
+				entry.name.c_str());
+		} else if (!entry.target_path.empty() && !entry.is_logical && logical_names.count(entry.name)) {
+			// the table says physical, the payload says Super -- don't guess
+			LOGERR("high-speed probe: '%s' is a physical partition here but the payload lists it in a Super group, stopping rather than guess\n",
+				entry.name.c_str());
+			return false;
+		}
 		entry.expanded_size = part.new_partition_info().size();
 		if (entry.target_path.empty()) {
 			LOGERR("high-speed probe: don't know where partition '%s' should be flashed, stopping rather than guess\n",
