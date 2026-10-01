@@ -952,8 +952,8 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 		nullptr
 	};
 
-	// the dumper's stdout is a pipe we read progress lines from. stderr is
-	// left alone (goes to recovery.log) so a dumper crash still explains itself
+	// the dumper's stdout and stderr are merged into a pipe we read progress
+	// and error lines from.
 	int out_pipe[2];
 	if (pipe2(out_pipe, O_CLOEXEC) != 0) {
 		LOGERR("high-speed: pipe2 failed (%s)\n", strerror(errno));
@@ -965,6 +965,7 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	pid_t pid = fork();
 	if (pid == 0) {
 		dup2(out_pipe[1], STDOUT_FILENO);  // dup2 result has no CLOEXEC, so it survives exec
+		dup2(out_pipe[1], STDERR_FILENO);  // Merge stderr so we catch Go panics and errors
 		execv(dumper_args[0], const_cast<char**>(dumper_args));
 		_exit(127);
 	} else if (pid < 0) {
@@ -979,17 +980,19 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	// never shown as 100: a partition reads 100 before its checksum/verity
 	// work has finished, and completion is announced by the "written and
 	// flushed" line once the dumper has exited cleanly
-	{
-		std::map<std::string, uint64_t> part_size;
-		std::map<std::string, int> part_pct;
-		uint64_t total_bytes = 0;
-		for (auto& part : plan) {
-			part_size[part.name] = part.expanded_size;
-			part_pct[part.name] = 0;
-			total_bytes += part.expanded_size;
-		}
-		int last_shown = -1;
-		std::string pending;
+
+	std::map<std::string, uint64_t> part_size;
+	std::map<std::string, int> part_pct;
+	bool saw_error_text = false;
+	uint64_t total_bytes = 0;
+	for (auto& part : plan) {
+		part_size[part.name] = part.expanded_size;
+		part_pct[part.name] = 0;
+		total_bytes += part.expanded_size;
+	}
+
+	int last_shown = -1;
+	std::string pending;
 		char chunk[512];
 		for (;;) {
 			ssize_t r = read(out_pipe[0], chunk, sizeof(chunk));
@@ -1005,13 +1008,39 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 			while ((nl = pending.find('\n')) != std::string::npos) {
 				std::string line = pending.substr(0, nl);
 				pending.erase(0, nl + 1);
+
+				// Strip trailing \r for cleaner logging and matching
+				if (!line.empty() && line.back() == '\r') {
+					line.pop_back();
+				}
+
+				// --- LAYER 2 PREP: ERROR KEYWORD SCANNING ---
+				std::string lower_line = line;
+				std::transform(lower_line.begin(), lower_line.end(), lower_line.begin(), ::tolower);
+				const char* keywords[] = {"panic:", "fatal error", "error:", "failed", "aborted", "corrupt", "mismatch", "bad crc", "unexpected eof"};
+				for (const char* kw : keywords) {
+					if (lower_line.find(kw) != std::string::npos) {
+						saw_error_text = true;
+						LOGERR("high-speed: dumper output error keyword '%s' in line: %s\n", kw, line.c_str());
+						break;
+					}
+				}
+
 				size_t colon = line.rfind(':');
 				if (colon == std::string::npos || total_bytes == 0)
 					continue;
 				auto it = part_pct.find(line.substr(0, colon));
 				if (it == part_pct.end())
 					continue;
-				int pct = atoi(line.c_str() + colon + 1);
+
+				// Ensure the part after the colon actually starts with a number
+				// (ignores leading spaces and avoids choking on trailing \r)
+				const char* pct_str = line.c_str() + colon + 1;
+				while (*pct_str == ' ') pct_str++; // skip any leading spaces
+
+				if (!isdigit((unsigned char)*pct_str)) continue;  // if it's not a number (e.g., " error"), skip it
+
+				int pct = atoi(pct_str);
 				it->second = std::max(0, std::min(100, pct));
 				uint64_t weighted = 0;
 				for (auto& kv : part_pct)
@@ -1029,18 +1058,42 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 			if (pending.size() > 4096)
 				pending.clear();  // never let a runaway line grow forever
 		}
-	}
 	close(out_pipe[0]);
 
 	pid_t waited;
 	do {
 		waited = waitpid(pid, &status, 0);
 	} while (waited < 0 && errno == EINTR);
+
+	// --- LAYER 1: Exit Status & Signals ---
+	if (WIFSIGNALED(status)) {
+		int sig = WTERMSIG(status);
+		LOGERR("high-speed: dumper CRASHED (killed by signal %d: %s)\n", sig, strsignal(sig));
+		gui_err("hs_extraction_crashed=The high-speed extractor crashed (likely due to a corrupted file). The active slot wasn't changed, but the target slot is incomplete.");
+		return HighSpeedResult::kAborted;
+	}
+
 	if (waited != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
 		LOGERR("high-speed: dumper failed (wait=%d status=0x%x)\n", (int)waited, status);
 		gui_err(("hs_extraction_failed=High-speed extraction failed, or a checksum didn't match. The slot you booted from wasn't touched and the active slot wasn't changed, but slot " +
 			target_slot + " is now incomplete. You Can Either Flash Using Normal Method, Or Reboot To Previous System Normally.").c_str());
 		return HighSpeedResult::kAborted;
+	}
+
+	// --- LAYER 2: Error Text in Output ---
+	if (saw_error_text) {
+		LOGERR("high-speed: dumper printed error keywords but exited with 0. Aborting.\n");
+		gui_err(("hs_dumper_error_text=The extractor reported an error during extraction but exited cleanly. The active slot wasn't changed; slot " + target_slot + " is incomplete.").c_str());
+		return HighSpeedResult::kAborted;
+	}
+
+	// --- LAYER 3: Completion Check (All partitions must reach 100%) ---
+	for (auto& kv : part_pct) {
+		if (kv.second < 100) {
+			LOGERR("high-speed: partition '%s' only reached %d%% before the dumper exited\n", kv.first.c_str(), kv.second);
+			gui_err(("hs_partition_incomplete=Partition '" + kv.first + "' wasn't fully extracted. The active slot wasn't changed; slot " + target_slot + " is incomplete.").c_str());
+			return HighSpeedResult::kAborted;
+		}
 	}
 
 	DataManager::SetProgress(1.0f);
