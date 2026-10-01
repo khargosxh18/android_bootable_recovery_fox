@@ -914,4 +914,8 @@ ifeq ($(FOX_NO_BLANK_DT2W),1)
         LOCAL_CFLAGS += -DFOX_NO_BLANK_DT2W
     endif
 endif
+
+ifneq ($(TW_NO_FASTBOOT_BOOT),)
+   LOCAL_CFLAGS += -DTW_NO_FASTBOOT_BOOT='"true"'
+endif
 #
