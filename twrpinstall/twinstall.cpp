@@ -455,55 +455,66 @@ bool GetBlockDeviceSize(const std::string& path, uint64_t* size) {
 }
 
 // works out the exact node a physical (boot/dtbo/vbmeta...) partition
-// must be written to on the TARGET slot, without touching any global slot
-// state. Primary_Block_Device is the bare fstab path, so appending the
-// target suffix gives the node directly (same pattern as
-// ReflashSelfToOtherSlot). refuses anything that isn't a real block
-// device, and refuses if it would resolve to the booted slot's node.
+// must be written to on the TARGET slot, without touching any global slot state.
+// The node name is built from the partition's own name, like
+// <by-name dir><name><target suffix>. It is not built from TWPartition's
+// Primary_Block_Device. Once recovery has restarted, TWRP has already
+// pointed the slot-less by-name link at the booted slot and keeps the
+// resolved node (for example /dev/block/sde12). Adding a suffix to that
+// names a node that does not exist.
+//
+// Every check here fails closed. The target must be a real block device,
+// and the booted slot's node must be found and must be a different device.
 bool ResolvePhysicalTarget(const HighSpeedPartitionPlan& part, const std::string& booted_suffix,
                            const std::string& target_suffix, std::string* node) {
-	std::string base;
-	TWPartition* twp = PartitionManager.Find_Partition_By_Path(part.target_path);
-	if (twp) {
-		if (!twp->Is_SlotSelect()) {
-			LOGERR("high-speed: '%s' is not a slot-select partition here, refusing to guess its target\n",
-				part.name.c_str());
-			return false;
-		}
-		base = twp->Get_Primary_Block_Device();
-	} else {
-		base = "/dev/block/bootdevice/by-name/" + part.name;
-		LOGINFO("high-speed: '%s' isn't in the fstab, using the by-name path\n", part.name.c_str());
-	}
-	if (base.empty()) {
-		LOGERR("high-speed: no block device known for '%s'\n", part.name.c_str());
-		return false;
-	}
-	LOGINFO("high-speed: '%s' primary block device is '%s'\n", part.name.c_str(), base.c_str());
-	auto ends_with = [&](const char* suf) {
-		return base.size() > 2 && base.compare(base.size() - 2, 2, suf) == 0;
-	};
-	if (ends_with("_a") || ends_with("_b")) {
-		LOGERR("high-speed: '%s' already looks slot-suffixed ('%s'), refusing to guess\n",
-			part.name.c_str(), base.c_str());
+	if (part.name.empty() || part.name.find('/') != std::string::npos ||
+	    part.name.find("..") != std::string::npos) {
+		LOGERR("high-speed: '%s' is not a usable partition name\n", part.name.c_str());
 		return false;
 	}
 
-	std::string target_real;
-	if (!ResolveBlockNode(base + target_suffix, &target_real)) {
-		LOGERR("high-speed: target node '%s%s' is missing or not a block device\n",
-			base.c_str(), target_suffix.c_str());
+	// if the fstab knows this partition, it has to be a slot-select one.
+	// only the flag is used here, never its block device path.
+	TWPartition* twp = PartitionManager.Find_Partition_By_Path(part.target_path);
+	if (twp && !twp->Is_SlotSelect()) {
+		LOGERR("high-speed: '%s' is not a slot-select partition here, refusing to guess its target\n",
+			part.name.c_str());
 		return false;
 	}
+
+	static const char* kByNameDirs[] = {
+		"/dev/block/bootdevice/by-name/",
+		"/dev/block/by-name/",
+	};
+	std::string dir, target_real;
+	for (const char* d : kByNameDirs) {
+		if (ResolveBlockNode(std::string(d) + part.name + target_suffix, &target_real)) {
+			dir = d;
+			break;
+		}
+	}
+	if (dir.empty()) {
+		LOGERR("high-speed: target node for '%s%s' is missing or not a block device\n",
+			part.name.c_str(), target_suffix.c_str());
+		return false;
+	}
+
+	// the booted slot's node must be found too. if it can't be, there is
+	// no way to prove the target is a different device, so stop.
 	std::string booted_real;
-	if (ResolveBlockNode(base + booted_suffix, &booted_real) && booted_real == target_real) {
+	if (!ResolveBlockNode(dir + part.name + booted_suffix, &booted_real)) {
+		LOGERR("high-speed: couldn't find the booted slot's node for '%s', can't prove the target is safe\n",
+			part.name.c_str());
+		return false;
+	}
+	if (booted_real == target_real) {
 		LOGERR("high-speed: target node for '%s' resolves to the booted slot's node, refusing\n",
 			part.name.c_str());
 		return false;
 	}
 	*node = target_real;
-	LOGINFO("high-speed: '%s' -> '%s%s' (%s)\n", part.name.c_str(), base.c_str(),
-		target_suffix.c_str(), target_real.c_str());
+	LOGINFO("high-speed: '%s' -> '%s%s%s' (%s)\n", part.name.c_str(), dir.c_str(),
+		part.name.c_str(), target_suffix.c_str(), target_real.c_str());
 	return true;
 }
 
