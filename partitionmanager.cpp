@@ -3580,15 +3580,53 @@ bool TWPartitionManager::Rebuild_Logical_Group_For_High_Speed_Flash(
 		return false;
 	}
 
-	for (auto& kv : partitions) {
-		std::string pname = kv.first + slot_suffix;
-		auto* p = builder->AddPartition(pname, group_name, 0 /* LP_PARTITION_ATTR_NONE */);
-		if (!p || !builder->ResizePartition(p, kv.second)) {
+	// adds every partition of this ROM to the group. on failure, says
+	// which one did not fit.
+	auto lay_out = [&](std::string* failed_name, uint64_t* failed_size) -> bool {
+		for (auto& kv : partitions) {
+			std::string pname = kv.first + slot_suffix;
+			auto* p = builder->AddPartition(pname, group_name, 0 /* LP_PARTITION_ATTR_NONE */);
+			if (!p || !builder->ResizePartition(p, kv.second)) {
+				*failed_name = pname;
+				*failed_size = kv.second;
+				return false;
+			}
+		}
+		return true;
+	};
+
+	std::string failed_name;
+	uint64_t failed_size = 0;
+	if (!lay_out(&failed_name, &failed_size)) {
+		LOGINFO("Couldn't fit '%s' (%llu bytes) next to the booted slot's partitions\n",
+			failed_name.c_str(), (unsigned long long)failed_size);
+
+		// The old ROM in the booted slot still holds its space. Nothing has
+		// been written yet, so start this slot's layout over, and this time
+		// give up the booted slot's partitions, like update_engine does
+		// when it flashes in recovery. Its data is only overwritten when
+		// the flash really starts.
+		const std::string source_suffix = (slot_suffix == "_b") ? "_a" : "_b";
+		bool dropped_any = false;
+		builder->RemoveGroupAndPartitions(group_name);
+		for (const std::string& g : builder->ListGroups()) {
+			if (g.size() <= source_suffix.size() ||
+			    g.compare(g.size() - source_suffix.size(), source_suffix.size(), source_suffix) != 0)
+				continue;
+			for (auto* sp : builder->ListPartitionsInGroup(g))
+				DestroyLogicalPartition(sp->name());
+			LOGINFO("Dropping the booted slot's group '%s' to make room\n", g.c_str());
+			builder->RemoveGroupAndPartitions(g);
+			dropped_any = true;
+		}
+		if (!dropped_any || !builder->AddGroup(group_name, group_max_size) ||
+		    !lay_out(&failed_name, &failed_size)) {
 			LOGERR("Unable to add/size partition '%s' at %llu bytes\n",
-				pname.c_str(), (unsigned long long)kv.second);
-			gui_err(("Unable to lay out '" + kv.first + "' in the rebuilt Super group.").c_str());
+				failed_name.c_str(), (unsigned long long)failed_size);
+			gui_err(("Unable to lay out '" + failed_name + "' in the rebuilt Super group.").c_str());
 			return false;
 		}
+		gui_print("Not enough room beside the booted slot, so its partitions will be overwritten.\n");
 	}
 
 	auto updated = builder->Export();
