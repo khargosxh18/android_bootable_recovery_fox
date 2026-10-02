@@ -3505,6 +3505,13 @@ bool TWPartitionManager::Rebuild_Logical_Group_For_High_Speed_Flash(
 		return false;
 	}
 
+	// A ported ROM flashes a raw super image, which carries its own table
+	// and can say the super is smaller than it really is. Raise the
+	// recorded size to the real device size so the layout below can use
+	// all of it. This only grows the size and never shrinks it.
+	if (builder->GrowBlockDevicesToLiveSize(android::fs_mgr::PartitionOpener()))
+		LOGINFO("Super: raised the recorded size to the real device size\n");
+
 	// every partition we're about to flash should already be in one
 	// group -- find it off the first one that still exists in the
 	// current table
