@@ -298,12 +298,13 @@ static int Run_Update_Binary(const char *path, int* wipe_cache, zip_type ztype) 
 // The normal AB install path hands the payload to update_engine, which
 // decompresses and hashes every operation one at a time on a single
 // thread -- that's the slow part, not the disk write. This path instead
-// lets payload-dumper-go decode the partitions in parallel and write them
-// DIRECTLY into the target slot's block nodes: the dumper's output
-// directory is a small farm of symlinks (<name>.img -> real block node),
-// so extraction is the flash, there is no scratch copy on /data and no
-// second write pass. Because the nodes must already exist at their final
-// size, the Super group for the target slot is rebuilt BEFORE extraction.
+// lets otaripper decode the partitions in parallel and write them
+// DIRECTLY into the target slot's block nodes: we open and exclusively
+// claim every node ourselves and hand the extractor the open descriptors,
+// so extraction is the flash, there is no scratch copy on /data, no second
+// write pass, and the extractor never gets a path to open. Because the
+// nodes must already exist at their final size, the Super group for the
+// target slot is rebuilt BEFORE extraction.
 // Finally the active slot is flipped by hand since update_engine never ran
 // to do it for us.
 //
@@ -319,10 +320,7 @@ static int Run_Update_Binary(const char *path, int* wipe_cache, zip_type ztype) 
 
 namespace {
 
-const char* kHighSpeedDumperPath = "/system/bin/payload-dumper-go";
-// directory of symlinks handed to the dumper as its output dir. lives on
-// the recovery ramdisk (tmpfs), holds only tiny symlinks, never real data
-const char* kHighSpeedLinkDir = "/tmp/hsf_links";
+const char* kHighSpeedExtractorPath = "/system/bin/otaripper";
 
 const size_t kPayloadMagicSize = 4;
 const size_t kPayloadVersionSize = 8;
@@ -518,35 +516,22 @@ bool ResolvePhysicalTarget(const HighSpeedPartitionPlan& part, const std::string
 	return true;
 }
 
-// empties and removes the symlink farm. unlinkat() on a symlink removes
-// the link itself and never follows it, so this can't reach a block node.
-void RemoveHighSpeedLinkFarm() {
-	DIR* d = opendir(kHighSpeedLinkDir);
-	if (d) {
-		int dfd = dirfd(d);
-		struct dirent* e;
-		while ((e = readdir(d)) != nullptr) {
-			if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
-				continue;
-			unlinkat(dfd, e->d_name, 0);
-		}
-		closedir(d);
-	}
-	rmdir(kHighSpeedLinkDir);
-}
-
-// payload-dumper-go can't decode these op types yet, so we check for them
-// up front instead of finding out partway through extraction
+// otaripper only decodes full-OTA "replace" style operations, so allow-list
+// exactly those (by proto value, so this builds against any update_metadata
+// version) and reject everything else up front instead of finding out
+// partway through extraction:
+//   0 REPLACE, 1 REPLACE_BZ, 6 ZERO, 7 DISCARD, 8 REPLACE_XZ, 14 REPLACE_ZSTD
 bool OpTypeIsSupported(chromeos_update_engine::InstallOperation::Type type) {
-	using Op = chromeos_update_engine::InstallOperation;
-	switch (type) {
-		case Op::PUFFDIFF:
-		case Op::ZUCCHINI:
-		case Op::LZ4DIFF_BSDIFF:
-		case Op::LZ4DIFF_PUFFDIFF:
-			return false;
-		default:
+	switch (static_cast<int>(type)) {
+		case 0:
+		case 1:
+		case 6:
+		case 7:
+		case 8:
+		case 14:
 			return true;
+		default:
+			return false;
 	}
 }
 
@@ -772,13 +757,6 @@ enum class HighSpeedResult {
 	kSucceeded,
 };
 
-// removes the symlink farm whenever this goes out of scope, win or lose.
-// only tiny symlinks ever live there -- the real data goes straight to
-// the block nodes, so there is nothing big to clean up on /data anymore.
-struct HighSpeedLinkFarmGuard {
-	~HighSpeedLinkFarmGuard() { RemoveHighSpeedLinkFarm(); }
-};
-
 HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHandle zip) {
 	if (!DataManager::GetIntValue("tw_high_speed_flash"))
 		return HighSpeedResult::kNotApplicable;
@@ -790,8 +768,8 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	// from here on the toggle is on and this really is an A/B payload zip,
 	// so every way out below is kAborted -- we never quietly drop back to
 	// the normal path once we've gotten this far
-	if (access(kHighSpeedDumperPath, X_OK) != 0) {
-		gui_err("hs_dumper_missing=High-speed flash is turned on but the dumper tool isn't on this build. Stopping.");
+	if (access(kHighSpeedExtractorPath, X_OK) != 0) {
+		gui_err("hs_dumper_missing=High-speed flash is turned on but the extractor tool isn't on this build. Stopping.");
 		return HighSpeedResult::kAborted;
 	}
 
@@ -873,37 +851,28 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	if (TWFunc::Path_Exists("/metadata/ota"))
 		TWFunc::removeDir("/metadata/ota", false);
 
-	// fresh, empty symlink farm for the dumper's output dir
-	RemoveHighSpeedLinkFarm();
-	if (mkdir(kHighSpeedLinkDir, 0700) != 0) {
-		LOGERR("high-speed: couldn't create '%s' (%s)\n", kHighSpeedLinkDir, strerror(errno));
-		gui_err("hs_scratch_mkdir_failed=Couldn't create the link folder for high-speed extraction. Nothing was written.");
-		return HighSpeedResult::kAborted;
-	}
-	HighSpeedLinkFarmGuard farm_guard;
-
-	// pass the dumper the biggest partitions first -- it starts them in
-	// the order we give it, and the biggest one decides how long the
-	// whole extraction takes, so it shouldn't sit queued behind small ones
+	// biggest partitions first. the extractor works through them in this
+	// order, and the biggest one decides how long the whole extraction
+	// takes, so it shouldn't sit queued behind small ones. the -p list and
+	// the descriptor list below are both built from this one ordering --
+	// the extractor pairs them up by position.
+	std::vector<const HighSpeedPartitionPlan*> by_size;
+	for (auto& part : plan)
+		by_size.push_back(&part);
+	std::stable_sort(by_size.begin(), by_size.end(),
+		[](const HighSpeedPartitionPlan* a, const HighSpeedPartitionPlan* b) {
+			return a->expanded_size > b->expanded_size;
+		});
 	std::string joined_names;
-	{
-		std::vector<const HighSpeedPartitionPlan*> by_size;
-		for (auto& part : plan)
-			by_size.push_back(&part);
-		std::stable_sort(by_size.begin(), by_size.end(),
-			[](const HighSpeedPartitionPlan* a, const HighSpeedPartitionPlan* b) {
-				return a->expanded_size > b->expanded_size;
-			});
-		for (size_t i = 0; i < by_size.size(); i++) {
-			if (i > 0)
-				joined_names += ",";
-			joined_names += by_size[i]->name;
-		}
+	for (size_t i = 0; i < by_size.size(); i++) {
+		if (i > 0)
+			joined_names += ",";
+		joined_names += by_size[i]->name;
 	}
 
 	// ---- first destructive step: lay out the target slot's Super group
 	// in ONE pass, at final sizes, so the dm nodes exist at the right size
-	// before the dumper opens them. this only rewrites the TARGET slot's
+	// before the extractor claims them. this only rewrites the TARGET slot's
 	// metadata; the booted slot's partitions are never touched.
 	std::map<std::string, std::string> mapped_paths;
 	{
@@ -957,17 +926,22 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 		nodes[part.name] = node;
 	}
 
-	// build the farm: <name>.img -> real block node. every node was
-	// verified above as an existing block device, so the dumper's open()
-	// can never fall into creating a regular file under /dev/block
-	for (auto& part : plan) {
-		std::string link = std::string(kHighSpeedLinkDir) + "/" + part.name + ".img";
-		if (symlink(nodes[part.name].c_str(), link.c_str()) != 0) {
-			LOGERR("high-speed: couldn't link '%s' -> '%s' (%s)\n", link.c_str(),
-				nodes[part.name].c_str(), strerror(errno));
-			gui_err("hs_link_failed=Couldn't set up the extraction targets. Nothing has been extracted; the active slot wasn't changed.");
+	// claim every target exclusively BEFORE the extractor starts. O_EXCL on
+	// a block device fails with EBUSY while it is mounted or held open by
+	// someone else, so the extractor can never write underneath a live
+	// filesystem. every node was verified above as an existing block device,
+	// so this can never fall into creating a regular file under /dev/block.
+	// the descriptors are inherited by the extractor as-is.
+	std::vector<android::base::unique_fd> target_fds;
+	for (const auto* part : by_size) {
+		android::base::unique_fd fd(open(nodes[part->name].c_str(), O_RDWR | O_EXCL | O_CLOEXEC));
+		if (fd == -1) {
+			LOGERR("high-speed: couldn't claim '%s' (%s)\n", nodes[part->name].c_str(), strerror(errno));
+			gui_err(("hs_target_claim_failed=Couldn't get exclusive access to the target for '" + part->name +
+				"'. It may still be mounted. Nothing has been extracted; the active slot wasn't changed.").c_str());
 			return HighSpeedResult::kAborted;
 		}
+		target_fds.push_back(std::move(fd));
 	}
 
 	gui_print("High-speed flash: writing partitions straight to slot %s, this takes some seconds...\n", target_slot.c_str());
@@ -975,17 +949,27 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	time_t extract_start, extract_stop;
 	time(&extract_start);
 
-	const char* dumper_args[] = {
-		kHighSpeedDumperPath,
-		"-c", "8",
-		"-m", // machine-readable: one "<partition>:<percent>" line per percent, no animated bars
-		"-p", joined_names.c_str(),
-		"-o", kHighSpeedLinkDir,
-		package.c_str(),
-		nullptr
-	};
+	// the extractor prints one "<partition>:<percent>" line per percent. a
+	// partition only reports 100 after it was fully written, checksummed and
+	// flushed. worker count is chosen by the extractor from CPUs and free RAM.
+	std::vector<std::string> extractor_args = { kHighSpeedExtractorPath };
+	for (const auto& fd : target_fds) {
+		extractor_args.push_back("--direct-fd");
+		extractor_args.push_back(std::to_string(fd.get()));
+	}
+	// optional: after the writes, drop the device cache and verify what the
+	// storage really holds instead of what the page cache holds (slower)
+	if (DataManager::GetIntValue("tw_high_speed_readback"))
+		extractor_args.push_back("--readback");
+	extractor_args.push_back("-p");
+	extractor_args.push_back(joined_names);
+	extractor_args.push_back(package);
+	std::vector<char*> extractor_argv;
+	for (auto& arg : extractor_args)
+		extractor_argv.push_back(const_cast<char*>(arg.c_str()));
+	extractor_argv.push_back(nullptr);
 
-	// the dumper's stdout and stderr are merged into a pipe we read progress
+	// the extractor's stdout and stderr are merged into a pipe we read progress
 	// and error lines from.
 	int out_pipe[2];
 	if (pipe2(out_pipe, O_CLOEXEC) != 0) {
@@ -998,8 +982,11 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	pid_t pid = fork();
 	if (pid == 0) {
 		dup2(out_pipe[1], STDOUT_FILENO);  // dup2 result has no CLOEXEC, so it survives exec
-		dup2(out_pipe[1], STDERR_FILENO);  // Merge stderr so we catch Go panics and errors
-		execv(dumper_args[0], const_cast<char**>(dumper_args));
+		dup2(out_pipe[1], STDERR_FILENO);  // merge stderr so we catch errors and panics
+		// the claimed targets were opened O_CLOEXEC; let them survive the exec
+		for (const auto& fd : target_fds)
+			fcntl(fd.get(), F_SETFD, 0);
+		execv(extractor_argv[0], extractor_argv.data());
 		_exit(127);
 	} else if (pid < 0) {
 		close(out_pipe[0]);
@@ -1010,13 +997,11 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	close(out_pipe[1]);
 
 	// overall progress = each partition's percent weighted by its size.
-	// never shown as 100: a partition reads 100 before its checksum/verity
-	// work has finished, and completion is announced by the "written and
-	// flushed" line once the dumper has exited cleanly
+	// never shown as 100: completion is announced by the "written and
+	// flushed" line once the extractor has exited cleanly
 
 	std::map<std::string, uint64_t> part_size;
 	std::map<std::string, int> part_pct;
-	bool saw_error_text = false;
 	uint64_t total_bytes = 0;
 	for (auto& part : plan) {
 		part_size[part.name] = part.expanded_size;
@@ -1035,7 +1020,7 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 				break;
 			}
 			if (r == 0)
-				break;  // dumper closed stdout (it exited)
+				break;  // extractor closed stdout (it exited)
 			pending.append(chunk, r);
 			size_t nl;
 			while ((nl = pending.find('\n')) != std::string::npos) {
@@ -1047,45 +1032,39 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 					line.pop_back();
 				}
 
-				// --- LAYER 2 PREP: ERROR KEYWORD SCANNING ---
-				std::string lower_line = line;
-				std::transform(lower_line.begin(), lower_line.end(), lower_line.begin(), ::tolower);
-				const char* keywords[] = {"panic:", "fatal error", "error:", "failed", "aborted", "corrupt", "mismatch", "bad crc", "unexpected eof"};
-				for (const char* kw : keywords) {
-					if (lower_line.find(kw) != std::string::npos) {
-						saw_error_text = true;
-						LOGERR("high-speed: dumper output error keyword '%s' in line: %s\n", kw, line.c_str());
-						break;
+				// "<partition>:<percent>" lines drive the progress bar. anything else
+				// the extractor prints (worker count, throughput summary, and on a
+				// failure its "ERROR: ..." line) is written to the recovery log.
+				// Whether the flash worked is decided by the exit status and the
+				// completion check below, never by what the text says.
+				bool is_progress = false;
+				size_t colon = line.rfind(':');
+				if (colon != std::string::npos && total_bytes != 0) {
+					auto it = part_pct.find(line.substr(0, colon));
+					const char* pct_str = line.c_str() + colon + 1;
+					while (*pct_str == ' ') pct_str++;
+					if (it != part_pct.end() && isdigit((unsigned char)*pct_str)) {
+						is_progress = true;
+						it->second = std::max(0, std::min(100, atoi(pct_str)));
+						uint64_t weighted = 0;
+						for (auto& kv : part_pct)
+							weighted += (uint64_t)kv.second * part_size[kv.first];
+						int overall = std::min<int>(99, (int)(weighted / total_bytes));
+						if (overall != last_shown) {
+							last_shown = overall;
+							// the GUI console is append-only and can't rewrite a line it
+							// already printed, so the live percentage goes to the progress
+							// bar instead (same mechanism the normal path's "set_progress"
+							// uses) -- one element updating in place, no line spam
+							DataManager::SetProgress(((float)overall) / 100.0f);
+						}
 					}
 				}
-
-				size_t colon = line.rfind(':');
-				if (colon == std::string::npos || total_bytes == 0)
-					continue;
-				auto it = part_pct.find(line.substr(0, colon));
-				if (it == part_pct.end())
-					continue;
-
-				// Ensure the part after the colon actually starts with a number
-				// (ignores leading spaces and avoids choking on trailing \r)
-				const char* pct_str = line.c_str() + colon + 1;
-				while (*pct_str == ' ') pct_str++; // skip any leading spaces
-
-				if (!isdigit((unsigned char)*pct_str)) continue;  // if it's not a number (e.g., " error"), skip it
-
-				int pct = atoi(pct_str);
-				it->second = std::max(0, std::min(100, pct));
-				uint64_t weighted = 0;
-				for (auto& kv : part_pct)
-					weighted += (uint64_t)kv.second * part_size[kv.first];
-				int overall = std::min<int>(99, (int)(weighted / total_bytes));
-				if (overall != last_shown) {
-					last_shown = overall;
-					// the GUI console is append-only and can't rewrite a line it
-					// already printed, so the live percentage goes to the progress
-					// bar instead (same mechanism the normal path's "set_progress"
-					// uses) -- one element updating in place, no line spam
-					DataManager::SetProgress(((float)overall) / 100.0f);
+				if (!is_progress && !line.empty()) {
+					if (line.rfind("ERROR", 0) == 0)
+						LOGERR("high-speed: extractor: %s\n", line.c_str());
+					else
+						LOGINFO("high-speed: extractor: %s\n", line.c_str());
 				}
 			}
 			if (pending.size() > 4096)
@@ -1098,32 +1077,28 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 		waited = waitpid(pid, &status, 0);
 	} while (waited < 0 && errno == EINTR);
 
-	// --- LAYER 1: Exit Status & Signals ---
+	// --- Check 1: exit status and signals (the authoritative result) ---
 	if (WIFSIGNALED(status)) {
 		int sig = WTERMSIG(status);
-		LOGERR("high-speed: dumper CRASHED (killed by signal %d: %s)\n", sig, strsignal(sig));
+		LOGERR("high-speed: extractor CRASHED (killed by signal %d: %s)\n", sig, strsignal(sig));
 		gui_err("hs_extraction_crashed=The high-speed extractor crashed (likely due to a corrupted file). The active slot wasn't changed, but the target slot is incomplete.");
 		return HighSpeedResult::kAborted;
 	}
 
 	if (waited != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-		LOGERR("high-speed: dumper failed (wait=%d status=0x%x)\n", (int)waited, status);
+		LOGERR("high-speed: extractor failed (wait=%d status=0x%x)\n", (int)waited, status);
 		gui_err(("hs_extraction_failed=High-speed extraction failed, or a checksum didn't match. The slot you booted from wasn't touched and the active slot wasn't changed, but slot " +
 			target_slot + " is now incomplete. You Can Either Flash Using Normal Method, Or Reboot To Previous System Normally.").c_str());
 		return HighSpeedResult::kAborted;
 	}
 
-	// --- LAYER 2: Error Text in Output ---
-	if (saw_error_text) {
-		LOGERR("high-speed: dumper printed error keywords but exited with 0. Aborting.\n");
-		gui_err(("hs_dumper_error_text=The extractor reported an error during extraction but exited cleanly. The active slot wasn't changed; slot " + target_slot + " is incomplete.").c_str());
-		return HighSpeedResult::kAborted;
-	}
-
-	// --- LAYER 3: Completion Check (All partitions must reach 100%) ---
+	// --- Check 2: completion. the extractor only reports 100 for a partition
+	// after it was written, checksummed and flushed, so a clean exit with any
+	// partition short of 100 means something went wrong that the exit status
+	// didn't show. this is the last gate before the slot gets switched.
 	for (auto& kv : part_pct) {
 		if (kv.second < 100) {
-			LOGERR("high-speed: partition '%s' only reached %d%% before the dumper exited\n", kv.first.c_str(), kv.second);
+			LOGERR("high-speed: partition '%s' only reached %d%% before the extractor exited\n", kv.first.c_str(), kv.second);
 			gui_err(("hs_partition_incomplete=Partition '" + kv.first + "' wasn't fully extracted. The active slot wasn't changed; slot " + target_slot + " is incomplete.").c_str());
 			return HighSpeedResult::kAborted;
 		}
@@ -1131,20 +1106,21 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 
 	DataManager::SetProgress(1.0f);
 
-	// the dumper writes through the page cache and doesn't fsync device
-	// nodes. flush every target explicitly, then a global sync, and only
-	// call it success if every flush went through.
+	// the extractor already fsync'd every partition it finished; flush
+	// each claimed target once more from here, then a global sync, and only
+	// call it success if every flush went through. the claims are released
+	// right after, before anything else touches these partitions.
 	gui_print("High-speed flash: flushing writes to storage...\n");
-	for (auto& kv : nodes) {
-		android::base::unique_fd fd(open(kv.second.c_str(), O_RDONLY | O_CLOEXEC));
-		if (fd == -1 || fsync(fd.get()) != 0) {
-			LOGERR("high-speed: couldn't flush '%s' (%s)\n", kv.second.c_str(), strerror(errno));
-			gui_err(("hs_flush_failed=Couldn't confirm that '" + kv.first +
+	for (size_t i = 0; i < target_fds.size(); i++) {
+		if (fsync(target_fds[i].get()) != 0) {
+			LOGERR("high-speed: couldn't flush '%s' (%s)\n", by_size[i]->name.c_str(), strerror(errno));
+			gui_err(("hs_flush_failed=Couldn't confirm that '" + by_size[i]->name +
 				"' was fully written to storage. The active slot wasn't changed; slot " + target_slot +
 				" should not be booted.").c_str());
 			return HighSpeedResult::kAborted;
 		}
 	}
+	target_fds.clear();
 	sync();
 
 	time(&extract_stop);

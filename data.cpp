@@ -1308,6 +1308,7 @@ void DataManager::SetDefaultValues()
   mData.SetValue(TW_ACTION_BUSY, "0");
   mData.SetValue("tw_wipe_cache", "0");
   mData.SetValue("tw_high_speed_flash", "0");
+  mData.SetValue("tw_high_speed_readback", "0"); // 1 = verify high-speed flashes by re-reading the device
   mData.SetValue("tw_wipe_dalvik", "0");
   mData.SetValue(TW_ZIP_INDEX, "0");
   mData.SetValue(TW_ZIP_QUEUE_COUNT, "0");
