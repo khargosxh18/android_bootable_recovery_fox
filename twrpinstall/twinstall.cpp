@@ -737,6 +737,38 @@ enum class HighSpeedResult {
 	kSucceeded,
 };
 
+// Runs the OrangeFox pre-ROM-flash script with exactly the same setup the
+// normal A/B path gives it, so that it can take its backup of the running
+// OrangeFox for the post-ROM-flash script to restore later:
+//   * the booted slot's system and /vendor mounted (backuptool-style scripts
+//     read from them)
+//   * a usable sh at /system/bin/sh (the recovery's own, bind-mounted over
+//     whatever the ROM has there)
+//   * a fresh recovery-partition checksum baseline for the overwrite check
+// everything is put back the way it was before returning, so by the time the
+// target slot is touched the mounts look exactly as they did before.
+static void RunPreRomFlashScript(const std::string& package) {
+	bool system_mount_state = PartitionManager.Is_Mounted_By_Path(PartitionManager.Get_Android_Root_Path());
+	bool vendor_mount_state = PartitionManager.Is_Mounted_By_Path("/vendor");
+	PartitionManager.Mount_By_Path(PartitionManager.Get_Android_Root_Path(), false);
+	PartitionManager.Mount_By_Path("/vendor", false);
+	TWFunc::copy_file("/system/bin/sh", "/tmp/sh", 0755);
+	mount("/tmp/sh", "/system/bin/sh", "auto", MS_BIND, NULL);
+
+	usleep(32);
+	if (TWFunc::Path_Exists(FOX_PRE_ROM_FLASH_SCRIPT))
+		TWFunc::RunFoxScript(FOX_PRE_ROM_FLASH_SCRIPT, package);
+
+	TWFunc::IsRecoveryOverwritten(true);
+
+	umount("/system/bin/sh");
+	unlink("/tmp/sh");
+	if (!vendor_mount_state)
+		PartitionManager.UnMount_By_Path("/vendor", false);
+	if (!system_mount_state)
+		PartitionManager.UnMount_By_Path(PartitionManager.Get_Android_Root_Path(), false);
+}
+
 HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHandle zip) {
 	if (!DataManager::GetIntValue("tw_high_speed_flash"))
 		return HighSpeedResult::kNotApplicable;
@@ -849,6 +881,10 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 			joined_names += ",";
 		joined_names += by_size[i]->name;
 	}
+
+	// the pre-ROM-flash script goes first, before anything on the target
+	// slot is touched -- the same moment the normal A/B path runs it
+	RunPreRomFlashScript(package);
 
 	// ---- first destructive step: lay out the target slot's Super group
 	// in ONE pass, at final sizes, so the dm nodes exist at the right size
