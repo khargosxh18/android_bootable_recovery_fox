@@ -45,6 +45,7 @@
 #include <set>
 #include <sys/statvfs.h>
 #include <sys/ioctl.h>
+#include <sys/sysmacros.h>
 #include <linux/fs.h>
 #include <dirent.h>
 #include <algorithm>
@@ -308,11 +309,11 @@ static int Run_Update_Binary(const char *path, int* wipe_cache, zip_type ztype) 
 // Finally the active slot is flipped by hand since update_engine never ran
 // to do it for us.
 //
-// This only ever runs when the user explicitly turned it on for this zip,
-// and it only ever touches system/vendor/product/boot-type partitions --
-// firmware (bootloader, modem, trustzone...) is never written by this
-// path, so a failed write here can't leave the device unable to reach
-// fastboot. If anything goes wrong, the install just stops -- there's no
+// This only runs when the user turned it on for this zip. By default it
+// only writes the ROM's own partitions (Super + boot chain). Firmware is
+// only written with the firmware option on, and each image is re-read and
+// SHA-256 checked before the slot is switched. If anything goes wrong,
+// the install just stops -- there's no
 // silent fallback to the normal path once a partition may have been
 // written, because at that point falling back could mean two different
 // code paths both trying to modify the same slot.
@@ -327,23 +328,36 @@ const size_t kPayloadVersionSize = 8;
 const size_t kPayloadManifestSizeSize = 8;
 const size_t kPayloadSignatureSizeSize = 4;
 
-// firmware and bootloader-ish partitions -- never flashed by this path,
-// on purpose. flash these the normal way, separately.
-const std::set<std::string>& HighSpeedExcludedPartitions() {
-	static const std::set<std::string> excluded = {
-		"abl", "aop", "aop_config", "bluetooth", "countrycode", "cpucp",
-		"cpucp_dtb", "devcfg", "dsp", "featenabler", "hyp", "imagefv",
-		"keymaster", "modem", "modemfirmware", "multiimgqti", "qupfw",
-		"shrm", "tz", "uefi", "uefisecapp", "xbl", "xbl_config", "xbl_ramdump",
+// boot-chain images an A/B ROM ships (same names on every vendor).
+// any other physical partition in the payload is treated as firmware,
+// since those names depend on the SoC.
+bool IsBootChainPartition(const std::string& name) {
+	static const std::set<std::string> boot_chain = {
+		"boot", "init_boot", "vendor_boot", "vendor_kernel_boot", "dtbo",
+		"recovery", "pvmfw",
 	};
-	return excluded;
+	return boot_chain.count(name) > 0 || name == "vbmeta" || name.compare(0, 7, "vbmeta_") == 0;
+}
+
+// identity, calibration and user data. an OTA never has these, so if the
+// payload does, stop. also rejects names that already have a slot suffix.
+bool IsProtectedPartition(const std::string& name) {
+	static const std::set<std::string> protected_names = {
+		"super", "userdata", "metadata", "misc", "persist", "cache", "frp",
+		"devinfo", "modemst1", "modemst2", "fsg", "fsc", "keystore", "config",
+	};
+	if (protected_names.count(name))
+		return true;
+	return name.size() > 2 &&
+		(name.compare(name.size() - 2, 2, "_a") == 0 || name.compare(name.size() - 2, 2, "_b") == 0);
 }
 
 struct HighSpeedPartitionPlan {
 	std::string name;          // bare partition name from the payload manifest
-	std::string target_path;   // the TWRP path Find_Partition_By_Path() expects
+	std::string target_path;   // "/" + name, for the fstab slot lookup
 	uint64_t expanded_size = 0; // decompressed size, straight from the manifest
 	bool is_logical = false;   // true if this one lives in Super (needs the group rebuild)
+	bool is_firmware = false;  // physical, not boot chain
 };
 
 // the dynamic-partition group the payload's manifest puts the logical
@@ -359,34 +373,6 @@ uint64_t ReadBigEndian64(const uint8_t* p) {
 	for (int i = 0; i < 8; i++)
 		v = (v << 8) | p[i];
 	return v;
-}
-
-// this is a plain lookup table, not something derived automatically --
-// the payload only knows partition group names, it has no idea what path
-// TWRP mounts them under, so this has to be kept in sync by hand with
-// whatever partitions your builds actually ship
-std::string ResolveTargetPath(const std::string& bare_name, bool* is_logical = nullptr) {
-	static const std::map<std::string, std::string> physical = {
-		{"boot", "/boot"}, {"dtbo", "/dtbo"}, {"init_boot", "/init_boot"},
-		{"recovery", "/recovery"}, {"vbmeta", "/vbmeta"},
-		{"vbmeta_system", "/vbmeta_system"}, {"vendor_boot", "/vendor_boot"},
-	};
-	static const std::map<std::string, std::string> logical = {
-		{"odm", "/odm"}, {"product", "/product"}, {"system", "/system"},
-		{"system_dlkm", "/system_dlkm"}, {"system_ext", "/system_ext"},
-		{"vendor", "/vendor"}, {"vendor_dlkm", "/vendor_dlkm"},
-	};
-	auto p = physical.find(bare_name);
-	if (p != physical.end()) {
-		if (is_logical) *is_logical = false;
-		return p->second;
-	}
-	auto l = logical.find(bare_name);
-	if (l != logical.end()) {
-		if (is_logical) *is_logical = true;
-		return l->second;
-	}
-	return "";
 }
 
 // which slot recovery itself booted from -- that slot must never be
@@ -429,6 +415,38 @@ bool GetBlockDeviceSize(const std::string& path, uint64_t* size) {
 	if (ioctl(fd.get(), BLKGETSIZE64, &bytes) != 0)
 		return false;
 	*size = bytes;
+	return true;
+}
+
+// extra checks for firmware targets, a bad write can't be undone there:
+// must be a real partition (not a whole disk), kernel PARTNAME must match
+// <name><target suffix>, and it must be writable
+bool VerifyFirmwareNode(const std::string& node, const std::string& expected_partname) {
+	struct stat st;
+	if (stat(node.c_str(), &st) != 0 || !S_ISBLK(st.st_mode))
+		return false;
+	const std::string sys = "/sys/dev/block/" + std::to_string(major(st.st_rdev)) + ":" +
+		std::to_string(minor(st.st_rdev));
+	if (access((sys + "/partition").c_str(), F_OK) != 0) {
+		LOGERR("high-speed: '%s' is not a kernel partition (whole disk?)\n", node.c_str());
+		return false;
+	}
+	std::string partname, line;
+	std::ifstream uevent(sys + "/uevent");
+	while (std::getline(uevent, line))
+		if (line.compare(0, 9, "PARTNAME=") == 0)
+			partname = line.substr(9);
+	if (partname != expected_partname) {
+		LOGERR("high-speed: '%s' is named '%s' by the kernel, expected '%s'\n", node.c_str(),
+			partname.c_str(), expected_partname.c_str());
+		return false;
+	}
+	android::base::unique_fd fd(open(node.c_str(), O_RDONLY | O_CLOEXEC));
+	int read_only = 1;
+	if (fd == -1 || ioctl(fd.get(), BLKROGET, &read_only) != 0 || read_only != 0) {
+		LOGERR("high-speed: '%s' is read-only or can't be queried\n", node.c_str());
+		return false;
+	}
 	return true;
 }
 
@@ -490,6 +508,10 @@ bool ResolvePhysicalTarget(const HighSpeedPartitionPlan& part, const std::string
 			part.name.c_str());
 		return false;
 	}
+	if (part.is_firmware && !VerifyFirmwareNode(target_real, part.name + target_suffix)) {
+		LOGERR("high-speed: firmware target for '%s' failed its identity checks, refusing\n", part.name.c_str());
+		return false;
+	}
 	*node = target_real;
 	LOGINFO("high-speed: '%s' -> '%s%s%s' (%s)\n", part.name.c_str(), dir.c_str(),
 		part.name.c_str(), target_suffix.c_str(), target_real.c_str());
@@ -519,9 +541,12 @@ bool OpTypeIsSupported(chromeos_update_engine::InstallOperation::Type type) {
 // manifest, so we know which partitions exist and whether anything in
 // there is a format we can't handle -- before touching disk at all
 bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip,
+                            bool include_firmware,
                             std::vector<HighSpeedPartitionPlan>* plan,
-                            HighSpeedGroupSpec* group_spec) {
+                            HighSpeedGroupSpec* group_spec,
+                            std::vector<std::string>* skipped_firmware) {
 	plan->clear();
+	skipped_firmware->clear();
 	*group_spec = HighSpeedGroupSpec();
 
 	ZipEntry64 payload_entry;
@@ -636,41 +661,36 @@ bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip
 	}
 
 	for (const auto& part : manifest.partitions()) {
-		if (HighSpeedExcludedPartitions().count(part.partition_name())) {
-			LOGINFO("high-speed probe: skipping firmware partition '%s', flash it separately\n",
-				part.partition_name().c_str());
+		const std::string& name = part.partition_name();
+		if (IsProtectedPartition(name)) {
+			LOGERR("high-speed probe: the payload contains '%s', which no ROM update may write -- stopping\n",
+				name.c_str());
+			return false;
+		}
+
+		HighSpeedPartitionPlan entry;
+		entry.name = name;
+		// payload says what's in Super, everything else is physical and
+		// goes to <name><target slot>
+		entry.is_logical = logical_names.count(name) > 0;
+		entry.is_firmware = !entry.is_logical && !IsBootChainPartition(name);
+		if (entry.is_firmware && !include_firmware) {
+			LOGINFO("high-speed probe: not flashing firmware partition '%s' (firmware option is off)\n",
+				name.c_str());
+			skipped_firmware->push_back(name);
 			continue;
 		}
 
 		for (const auto& op : part.operations()) {
 			if (!OpTypeIsSupported(op.type())) {
 				LOGERR("high-speed probe: partition '%s' uses an operation type we can't decode\n",
-					part.partition_name().c_str());
+					name.c_str());
 				return false;
 			}
 		}
 
-		HighSpeedPartitionPlan entry;
-		entry.name = part.partition_name();
-		entry.target_path = ResolveTargetPath(entry.name, &entry.is_logical);
-		if (entry.target_path.empty() && logical_names.count(entry.name)) {
-			// a Super partition that isn't in the hard-coded table
-			entry.target_path = "/" + entry.name;
-			entry.is_logical = true;
-			LOGINFO("high-speed probe: '%s' isn't in the built-in table, but the payload lists it in a Super group -- treating it as a logical partition\n",
-				entry.name.c_str());
-		} else if (!entry.target_path.empty() && !entry.is_logical && logical_names.count(entry.name)) {
-			// the table says physical, the payload says Super -- don't guess
-			LOGERR("high-speed probe: '%s' is a physical partition here but the payload lists it in a Super group, stopping rather than guess\n",
-				entry.name.c_str());
-			return false;
-		}
+		entry.target_path = "/" + name;
 		entry.expanded_size = part.new_partition_info().size();
-		if (entry.target_path.empty()) {
-			LOGERR("high-speed probe: don't know where partition '%s' should be flashed, stopping rather than guess\n",
-				entry.name.c_str());
-			return false;
-		}
 		plan->push_back(std::move(entry));
 	}
 
@@ -788,9 +808,28 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	gui_print("High-speed flash: reading the payload...\n");
 	std::vector<HighSpeedPartitionPlan> plan;
 	HighSpeedGroupSpec group_spec;
-	if (!ProbeHighSpeedPayload(package, zip, &plan, &group_spec)) {
+	std::vector<std::string> skipped_firmware;
+	const bool include_firmware = DataManager::GetIntValue("tw_high_speed_firmware") != 0;
+	if (!ProbeHighSpeedPayload(package, zip, include_firmware, &plan, &group_spec, &skipped_firmware)) {
 		gui_err("hs_probe_failed=This package doesn't work with high-speed flash (delta payload, an operation type we can't decode, or inconsistent Super group info). Turn off high-speed flash for this package and try again.");
 		return HighSpeedResult::kAborted;
+	}
+
+	if (!skipped_firmware.empty()) {
+		std::string list;
+		for (const auto& n : skipped_firmware)
+			list += (list.empty() ? "" : ", ") + n;
+		gui_print("High-speed flash: firmware skipped (%s), firmware option is off.\n",
+			list.c_str());
+	}
+	{
+		std::string list;
+		for (const auto& p : plan)
+			if (p.is_firmware)
+				list += (list.empty() ? "" : ", ") + p.name;
+		if (!list.empty())
+			gui_print("High-speed flash: firmware included (%s), verified before the slot switch. Don't flash firmware older than what's installed (anti-rollback).\n",
+				list.c_str());
 	}
 
 	// ---- which slot are we allowed to write? -------------------------
@@ -977,6 +1016,17 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	// storage really holds instead of what the page cache holds (slower)
 	if (DataManager::GetIntValue("tw_high_speed_readback"))
 		extractor_args.push_back("--readback");
+	// firmware is always re-read and SHA-256 checked before the slot switch
+	{
+		std::string firmware_list;
+		for (const auto* part : by_size)
+			if (part->is_firmware)
+				firmware_list += (firmware_list.empty() ? "" : ",") + part->name;
+		if (!firmware_list.empty()) {
+			extractor_args.push_back("--readback-for");
+			extractor_args.push_back(firmware_list);
+		}
+	}
 	extractor_args.push_back("-p");
 	extractor_args.push_back(joined_names);
 	extractor_args.push_back(package);
