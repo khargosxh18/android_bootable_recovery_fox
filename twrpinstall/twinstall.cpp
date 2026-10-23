@@ -324,6 +324,34 @@ namespace {
 
 const char* kHighSpeedExtractorPath = "/system/bin/otaripper";
 
+std::string g_hs_reason;
+
+void HsWhy(const std::string& why) { g_hs_reason = why; }
+void HsSay(const std::string& text) { gui_print("%s\n", text.c_str()); }
+void HsWarn(const std::string& text) { gui_print_color("warning", "%s\n", text.c_str()); }
+void HsFail(const std::string& what) { gui_print_color("error", "  ERROR: %s\n", what.c_str()); }
+
+std::string HsSize(uint64_t bytes) {
+	char buf[32];
+	if (bytes >= (1ULL << 30))
+		snprintf(buf, sizeof(buf), "%.2f GiB", bytes / double(1ULL << 30));
+	else
+		snprintf(buf, sizeof(buf), "%.0f MiB", bytes / double(1ULL << 20));
+	return buf;
+}
+
+std::string HsTrim(std::string line) {
+	if (line.compare(0, 6, "ERROR:") == 0)
+		line.erase(0, 6);
+	while (!line.empty() && line.front() == ' ')
+		line.erase(0, 1);
+	if (line.size() > 120) {
+		line.resize(117);
+		line += "...";
+	}
+	return line;
+}
+
 const size_t kPayloadMagicSize = 4;
 const size_t kPayloadVersionSize = 8;
 const size_t kPayloadManifestSizeSize = 8;
@@ -430,7 +458,7 @@ bool VerifyFirmwareNode(const std::string& node, const std::string& expected_par
 	const std::string sys = "/sys/dev/block/" + std::to_string(major(st.st_rdev)) + ":" +
 		std::to_string(minor(st.st_rdev));
 	if (access((sys + "/partition").c_str(), F_OK) != 0) {
-		LOGERR("high-speed: '%s' is not a kernel partition (whole disk?)\n", node.c_str());
+		HsWhy("'" + expected_partname + "' is not a kernel partition");
 		return false;
 	}
 	std::string partname, line;
@@ -439,14 +467,13 @@ bool VerifyFirmwareNode(const std::string& node, const std::string& expected_par
 		if (line.compare(0, 9, "PARTNAME=") == 0)
 			partname = line.substr(9);
 	if (partname != expected_partname) {
-		LOGERR("high-speed: '%s' is named '%s' by the kernel, expected '%s'\n", node.c_str(),
-			partname.c_str(), expected_partname.c_str());
+		HsWhy("kernel names the target '" + partname + "', expected '" + expected_partname + "'");
 		return false;
 	}
 	android::base::unique_fd fd(open(node.c_str(), O_RDONLY | O_CLOEXEC));
 	int read_only = 1;
 	if (fd == -1 || ioctl(fd.get(), BLKROGET, &read_only) != 0 || read_only != 0) {
-		LOGERR("high-speed: '%s' is read-only or can't be queried\n", node.c_str());
+		HsWhy("'" + expected_partname + "' is read-only");
 		return false;
 	}
 	return true;
@@ -494,7 +521,7 @@ bool ResolvePhysicalTarget(const HighSpeedPartitionPlan& part, const std::string
                            const std::string& target_suffix, std::string* node) {
 	if (part.name.empty() || part.name.find('/') != std::string::npos ||
 	    part.name.find("..") != std::string::npos) {
-		LOGERR("high-speed: '%s' is not a usable partition name\n", part.name.c_str());
+		HsWhy("'" + part.name + "' is not a usable partition name");
 		return false;
 	}
 
@@ -502,8 +529,7 @@ bool ResolvePhysicalTarget(const HighSpeedPartitionPlan& part, const std::string
 	// only the flag is used here, never its block device path.
 	TWPartition* twp = PartitionManager.Find_Partition_By_Path(part.target_path);
 	if (twp && !twp->Is_SlotSelect()) {
-		LOGERR("high-speed: '%s' is not a slot-select partition here, refusing to guess its target\n",
-			part.name.c_str());
+		HsWhy("'" + part.name + "' is not a slot-select partition on this device");
 		return false;
 	}
 
@@ -519,8 +545,7 @@ bool ResolvePhysicalTarget(const HighSpeedPartitionPlan& part, const std::string
 		}
 	}
 	if (dir.empty()) {
-		LOGERR("high-speed: target node for '%s%s' is missing or not a block device\n",
-			part.name.c_str(), target_suffix.c_str());
+		HsWhy("no block device for '" + part.name + target_suffix + "'");
 		return false;
 	}
 
@@ -528,17 +553,14 @@ bool ResolvePhysicalTarget(const HighSpeedPartitionPlan& part, const std::string
 	// no way to prove the target is a different device, so stop.
 	std::string booted_real;
 	if (!ResolveBlockNode(dir + part.name + booted_suffix, &booted_real)) {
-		LOGERR("high-speed: couldn't find the booted slot's node for '%s', can't prove the target is safe\n",
-			part.name.c_str());
+		HsWhy("can't find '" + part.name + booted_suffix + "' to compare against");
 		return false;
 	}
 	if (booted_real == target_real) {
-		LOGERR("high-speed: target node for '%s' resolves to the booted slot's node, refusing\n",
-			part.name.c_str());
+		HsWhy("'" + part.name + "' target is the booted slot's partition");
 		return false;
 	}
 	if (part.is_firmware && !VerifyFirmwareNode(target_real, part.name + target_suffix)) {
-		LOGERR("high-speed: firmware target for '%s' failed its identity checks, refusing\n", part.name.c_str());
 		return false;
 	}
 	*node = target_real;
@@ -576,11 +598,12 @@ bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip
                             std::vector<std::string>* skipped_firmware) {
 	plan->clear();
 	skipped_firmware->clear();
+	g_hs_reason = "unknown reason";
 	*group_spec = HighSpeedGroupSpec();
 
 	ZipEntry64 payload_entry;
 	if (FindEntry(zip, "payload.bin", &payload_entry) != 0) {
-		LOGERR("high-speed probe: payload.bin not found in zip\n");
+		HsWhy("payload.bin not found in the zip");
 		return false;
 	}
 
@@ -589,7 +612,7 @@ bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip
 	// uncompressed inside the zip -- most OTA tooling does this already,
 	// but if it isn't, bail rather than read garbage
 	if (payload_entry.method != 0) {
-		LOGERR("high-speed probe: payload.bin is compressed inside the zip, can't read it directly\n");
+		HsWhy("payload.bin is compressed inside the zip");
 		return false;
 	}
 
@@ -598,7 +621,7 @@ bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip
 
 	android::base::unique_fd fd(open(package_path.c_str(), O_RDONLY | O_CLOEXEC));
 	if (fd == -1) {
-		LOGERR("high-speed probe: couldn't open the zip file\n");
+		HsWhy("can't open the zip");
 		return false;
 	}
 
@@ -608,11 +631,11 @@ bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip
 		if (r < 0) {
 			if (errno == EINTR)
 				continue;
-			LOGERR("high-speed probe: read failed (%s)\n", strerror(errno));
+			HsWhy(std::string("can't read the payload (") + strerror(errno) + ")");
 			return false;
 		}
 		if (r == 0) {
-			LOGERR("high-speed probe: hit end of file early while reading payload.bin\n");
+			HsWhy("payload.bin ends early");
 			return false;
 		}
 		got += r;
@@ -621,7 +644,7 @@ bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip
 	size_t off = 0;
 	if (to_read < kPayloadMagicSize + kPayloadVersionSize + kPayloadManifestSizeSize ||
 	    memcmp(buf.data(), "CrAU", kPayloadMagicSize) != 0) {
-		LOGERR("high-speed probe: payload.bin doesn't start with the expected magic\n");
+		HsWhy("payload.bin has a bad header");
 		return false;
 	}
 	off += kPayloadMagicSize;
@@ -629,8 +652,7 @@ bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip
 	uint64_t version = ReadBigEndian64(buf.data() + off);
 	off += kPayloadVersionSize;
 	if (version != 2) {
-		LOGERR("high-speed probe: payload version %llu isn't one we understand\n",
-			(unsigned long long)version);
+		HsWhy("payload version " + std::to_string(version) + " is not supported");
 		return false;
 	}
 
@@ -638,7 +660,7 @@ bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip
 	off += kPayloadManifestSizeSize;
 
 	if (off + kPayloadSignatureSizeSize > to_read) {
-		LOGERR("high-speed probe: payload header is truncated\n");
+		HsWhy("payload header is truncated");
 		return false;
 	}
 	off += kPayloadSignatureSizeSize;
@@ -654,11 +676,11 @@ bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip
 			if (r < 0) {
 				if (errno == EINTR)
 					continue;
-				LOGERR("high-speed probe: read failed while re-reading the full manifest (%s)\n", strerror(errno));
+				HsWhy(std::string("can't read the payload manifest (") + strerror(errno) + ")");
 				return false;
 			}
 			if (r == 0) {
-				LOGERR("high-speed probe: hit end of file early while re-reading the manifest\n");
+				HsWhy("payload manifest ends early");
 				return false;
 			}
 			got += r;
@@ -667,7 +689,7 @@ bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip
 
 	chromeos_update_engine::DeltaArchiveManifest manifest;
 	if (!manifest.ParseFromArray(buf.data() + off, manifest_size)) {
-		LOGERR("high-speed probe: couldn't parse the payload manifest\n");
+		HsWhy("can't parse the payload manifest");
 		return false;
 	}
 
@@ -675,7 +697,7 @@ bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip
 		// a nonzero minor version means this is a delta payload, which
 		// references an old partition we don't have lying around in the
 		// shape this path expects -- full payloads only here
-		LOGERR("high-speed probe: this is a delta payload, not a full one -- not supported here\n");
+		HsWhy("incremental (delta) package, a full OTA is needed");
 		return false;
 	}
 
@@ -692,8 +714,7 @@ bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip
 	for (const auto& part : manifest.partitions()) {
 		const std::string& name = part.partition_name();
 		if (IsProtectedPartition(name)) {
-			LOGERR("high-speed probe: the payload contains '%s', which no ROM update may write -- stopping\n",
-				name.c_str());
+			HsWhy("payload writes the protected partition '" + name + "'");
 			return false;
 		}
 
@@ -712,8 +733,7 @@ bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip
 
 		for (const auto& op : part.operations()) {
 			if (!OpTypeIsSupported(op.type())) {
-				LOGERR("high-speed probe: partition '%s' uses an operation type we can't decode\n",
-					name.c_str());
+				HsWhy("'" + name + "' uses an operation type that can't be decoded");
 				return false;
 			}
 		}
@@ -724,8 +744,10 @@ bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip
 		plan->push_back(std::move(entry));
 	}
 
-	if (plan->empty())
+	if (plan->empty()) {
+		HsWhy("nothing to flash in this package");
 		return false;
+	}
 
 	// which Super group does the payload say the logical partitions live
 	// in, and how big is its budget? all of them must be in ONE group --
@@ -748,21 +770,18 @@ bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip
 						if (n != entry.name)
 							continue;
 						if (owner && owner != &g) {
-							LOGERR("high-speed probe: partition '%s' is listed in more than one group\n",
-								entry.name.c_str());
+							HsWhy("'" + entry.name + "' is listed in more than one dynamic group");
 							return false;
 						}
 						owner = &g;
 					}
 				}
 				if (!owner) {
-					LOGERR("high-speed probe: logical partition '%s' isn't listed in any dynamic partition group\n",
-						entry.name.c_str());
+					HsWhy("'" + entry.name + "' isn't in any dynamic group");
 					return false;
 				}
 				if (chosen && chosen != owner) {
-					LOGERR("high-speed probe: the logical partitions span more than one group ('%s' and '%s'), not supported\n",
-						chosen->name().c_str(), owner->name().c_str());
+					HsWhy("the partitions span more than one dynamic group");
 					return false;
 				}
 				chosen = owner;
@@ -830,36 +849,40 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	// from here on the toggle is on and this really is an A/B payload zip,
 	// so every way out below is kAborted -- we never quietly drop back to
 	// the normal path once we've gotten this far
+	struct QuietDetails {
+		QuietDetails() { DataManager::SetValue("tw_quiet_details", 1); }
+		~QuietDetails() { DataManager::SetValue("tw_quiet_details", 0); }
+	} quiet_details;
+
 	if (access(kHighSpeedExtractorPath, X_OK) != 0) {
-		gui_err("hs_dumper_missing=High-speed flash is turned on but the extractor tool isn't on this build. Stopping.");
+		HsFail("extractor missing (/system/bin/otaripper)");
 		return HighSpeedResult::kAborted;
 	}
 
-	gui_print("High-speed flash: reading the payload...\n");
+	HsSay("High-speed flash");
+	HsSay("  Reading payload...");
 	std::vector<HighSpeedPartitionPlan> plan;
 	HighSpeedGroupSpec group_spec;
 	std::vector<std::string> skipped_firmware;
 	const bool include_firmware = DataManager::GetIntValue("tw_high_speed_firmware") != 0;
 	if (!ProbeHighSpeedPayload(package, zip, include_firmware, &plan, &group_spec, &skipped_firmware)) {
-		gui_err("hs_probe_failed=This package doesn't work with high-speed flash (delta payload, an operation type we can't decode, or inconsistent Super group info). Turn off high-speed flash for this package and try again.");
+		HsFail("package not supported: " + g_hs_reason);
 		return HighSpeedResult::kAborted;
 	}
 
-	if (!skipped_firmware.empty()) {
-		std::string list;
-		for (const auto& n : skipped_firmware)
-			list += (list.empty() ? "" : ", ") + n;
-		gui_print("High-speed flash: firmware skipped (%s), firmware option is off.\n",
-			list.c_str());
-	}
 	{
-		std::string list;
-		for (const auto& p : plan)
+		uint64_t total = 0;
+		size_t firmware_count = 0;
+		for (const auto& p : plan) {
+			total += p.expanded_size;
 			if (p.is_firmware)
-				list += (list.empty() ? "" : ", ") + p.name;
-		if (!list.empty())
-			gui_print("High-speed flash: firmware included (%s), verified before the slot switch. Don't flash firmware older than what's installed (anti-rollback).\n",
-				list.c_str());
+				firmware_count++;
+		}
+		HsSay("  Payload: " + std::to_string(plan.size()) + " images, " + HsSize(total));
+		if (firmware_count)
+			HsSay("  Firmware: " + std::to_string(firmware_count) + " images included, verified from storage");
+		else if (!skipped_firmware.empty())
+			HsSay("  Firmware: not flashed (" + std::to_string(skipped_firmware.size()) + " skipped)");
 	}
 
 	// ---- which slot are we allowed to write? -------------------------
@@ -867,21 +890,21 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	// which one that is, stop before touching anything.
 	const std::string booted_slot = DetermineBootedSlot();
 	if (booted_slot.empty()) {
-		gui_err("hs_slot_unknown=Couldn't tell which slot is currently booted, so high-speed flash can't pick a safe target. Stopping.");
+		HsFail("can't tell which slot is booted");
 		return HighSpeedResult::kAborted;
 	}
 	const std::string target_slot = (booted_slot == "A") ? "B" : "A";
 	const std::string booted_suffix = (booted_slot == "A") ? "_a" : "_b";
 	const std::string target_suffix = (target_slot == "A") ? "_a" : "_b";
 	LOGINFO("high-speed: booted slot %s, writing slot %s\n", booted_slot.c_str(), target_slot.c_str());
+	HsSay("  Target: slot " + target_slot + " (booted from " + booted_slot + ")");
 
 	// no partition may appear twice in the plan
 	{
 		std::set<std::string> seen_names;
 		for (auto& part : plan) {
 			if (!seen_names.insert(part.name).second) {
-				LOGERR("high-speed: partition '%s' appears twice in the payload\n", part.name.c_str());
-				gui_err("hs_duplicate_part=The payload lists the same partition twice. Stopping before anything is written.");
+				HsFail("'" + part.name + "' appears twice in the payload");
 				return HighSpeedResult::kAborted;
 			}
 		}
@@ -898,27 +921,20 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 			continue;
 		std::string node;
 		if (!ResolvePhysicalTarget(part, booted_suffix, target_suffix, &node)) {
-			gui_err(("hs_target_invalid=Couldn't find a safe target for '" + part.name +
-				"' on slot " + target_slot + ". Nothing was written. See the log for details.").c_str());
+			HsFail(g_hs_reason);
 			return HighSpeedResult::kAborted;
 		}
 		uint64_t node_size = 0;
 		if (!GetBlockDeviceSize(node, &node_size)) {
-			LOGERR("high-speed: couldn't read the size of '%s'\n", node.c_str());
-			gui_err(("hs_target_size_unknown=Couldn't read the size of the target for '" + part.name +
-				"'. Nothing was written.").c_str());
+			HsFail("can't read the size of the '" + part.name + "' target");
 			return HighSpeedResult::kAborted;
 		}
 		if (node_size < part.expanded_size) {
-			LOGERR("high-speed: image for '%s' is %llu bytes but the target node is only %llu\n",
-				part.name.c_str(), (unsigned long long)part.expanded_size, (unsigned long long)node_size);
-			gui_err(("hs_target_too_small=The image for '" + part.name +
-				"' is bigger than its partition on slot " + target_slot + ". Nothing was written.").c_str());
+			HsFail("'" + part.name + "' is " + HsSize(part.expanded_size) + ", its slot " + target_slot + " partition only " + HsSize(node_size));
 			return HighSpeedResult::kAborted;
 		}
 		if (!seen_nodes.insert(node).second) {
-			LOGERR("high-speed: two partitions resolve to the same node '%s'\n", node.c_str());
-			gui_err("hs_target_collision=Two partitions resolved to the same target. Nothing was written.");
+			HsFail("two images map to the same device ('" + part.name + "')");
 			return HighSpeedResult::kAborted;
 		}
 		nodes[part.name] = node;
@@ -967,11 +983,9 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 				logical_sizes.push_back({part.name, part.expanded_size});
 		}
 		if (!logical_sizes.empty())
-			gui_print("High-speed flash: laying out the Super partitions for slot %s...\n", target_slot.c_str());
+			HsSay("  Super layout for slot " + target_slot + "...");
 		if (!PartitionManager.Rebuild_Logical_Group_For_High_Speed_Flash(target_suffix, logical_sizes,
 			group_spec.name, group_spec.size, &mapped_paths)) {
-			gui_err(("hs_group_rebuild_failed=Couldn't lay out the Super partition group for this ROM. The slot you booted from wasn't touched and the active slot wasn't changed; slot " +
-				target_slot + " may be incomplete. See the log above for details.").c_str());
 			return HighSpeedResult::kAborted;
 		}
 	}
@@ -982,30 +996,21 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 			continue;
 		auto it = mapped_paths.find(part.name);
 		if (it == mapped_paths.end()) {
-			LOGERR("high-speed: no mapped node was returned for '%s'\n", part.name.c_str());
-			gui_err(("hs_map_missing=The partition '" + part.name + "' wasn't mapped after the Super layout. Nothing has been extracted; the active slot wasn't changed.").c_str());
+			HsFail("Super layout gave no device for '" + part.name + "'");
 			return HighSpeedResult::kAborted;
 		}
 		std::string node;
 		if (!ResolveBlockNode(it->second, &node)) {
-			LOGERR("high-speed: mapped path '%s' for '%s' isn't a block device\n",
-				it->second.c_str(), part.name.c_str());
-			gui_err(("hs_map_invalid=The mapped target for '" + part.name +
-				"' isn't a valid block device. Nothing has been extracted; the active slot wasn't changed.").c_str());
+			HsFail("Super device for '" + part.name + "' is not a block device");
 			return HighSpeedResult::kAborted;
 		}
 		uint64_t node_size = 0;
 		if (!GetBlockDeviceSize(node, &node_size) || node_size < part.expanded_size) {
-			LOGERR("high-speed: mapped node '%s' for '%s' is %llu bytes, need %llu\n",
-				node.c_str(), part.name.c_str(), (unsigned long long)node_size,
-				(unsigned long long)part.expanded_size);
-			gui_err(("hs_map_too_small=The mapped target for '" + part.name +
-				"' is smaller than its image. Nothing has been extracted; the active slot wasn't changed.").c_str());
+			HsFail("Super device for '" + part.name + "' is " + HsSize(node_size) + ", the image is " + HsSize(part.expanded_size));
 			return HighSpeedResult::kAborted;
 		}
 		if (!seen_nodes.insert(node).second) {
-			LOGERR("high-speed: mapped node '%s' collides with another target\n", node.c_str());
-			gui_err("hs_target_collision=Two partitions resolved to the same target. Nothing has been extracted; the active slot wasn't changed.");
+			HsFail("two images map to the same Super device ('" + part.name + "')");
 			return HighSpeedResult::kAborted;
 		}
 		nodes[part.name] = node;
@@ -1021,15 +1026,13 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	for (const auto* part : by_size) {
 		android::base::unique_fd fd(open(nodes[part->name].c_str(), O_RDWR | O_EXCL | O_CLOEXEC));
 		if (fd == -1) {
-			LOGERR("high-speed: couldn't claim '%s' (%s)\n", nodes[part->name].c_str(), strerror(errno));
-			gui_err(("hs_target_claim_failed=Couldn't get exclusive access to the target for '" + part->name +
-				"'. It may still be mounted. Nothing has been extracted; the active slot wasn't changed.").c_str());
+			HsFail("'" + part->name + "' is busy, no exclusive access (" + strerror(errno) + ")");
 			return HighSpeedResult::kAborted;
 		}
 		target_fds.push_back(std::move(fd));
 	}
 
-	gui_print("High-speed flash: writing partitions straight to slot %s, this takes some seconds...\n", target_slot.c_str());
+	HsSay("  Writing " + std::to_string(plan.size()) + " images...");
 
 	time_t extract_start, extract_stop;
 	time(&extract_start);
@@ -1069,8 +1072,7 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	// and error lines from.
 	int out_pipe[2];
 	if (pipe2(out_pipe, O_CLOEXEC) != 0) {
-		LOGERR("high-speed: pipe2 failed (%s)\n", strerror(errno));
-		gui_err("hs_dumper_launch_failed=Couldn't start the high-speed extractor. Nothing has been extracted; the active slot wasn't changed.");
+		HsFail(std::string("can't start the extractor (") + strerror(errno) + ")");
 		return HighSpeedResult::kAborted;
 	}
 
@@ -1087,7 +1089,7 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	} else if (pid < 0) {
 		close(out_pipe[0]);
 		close(out_pipe[1]);
-		gui_err("hs_dumper_launch_failed=Couldn't start the high-speed extractor. Nothing has been extracted; the active slot wasn't changed.");
+		HsFail(std::string("can't start the extractor (") + strerror(errno) + ")");
 		return HighSpeedResult::kAborted;
 	}
 	close(out_pipe[1]);
@@ -1098,6 +1100,7 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 
 	std::map<std::string, uint64_t> part_size;
 	std::map<std::string, int> part_pct;
+	std::string last_error;
 	uint64_t total_bytes = 0;
 	for (auto& part : plan) {
 		part_size[part.name] = part.expanded_size;
@@ -1158,9 +1161,8 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 				}
 				if (!is_progress && !line.empty()) {
 					if (line.rfind("ERROR", 0) == 0)
-						LOGERR("high-speed: extractor: %s\n", line.c_str());
-					else
-						LOGINFO("high-speed: extractor: %s\n", line.c_str());
+						last_error = line;
+					LOGINFO("high-speed: extractor: %s\n", line.c_str());
 				}
 			}
 			if (pending.size() > 4096)
@@ -1176,15 +1178,12 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	// --- Check 1: exit status and signals (the authoritative result) ---
 	if (WIFSIGNALED(status)) {
 		int sig = WTERMSIG(status);
-		LOGERR("high-speed: extractor CRASHED (killed by signal %d: %s)\n", sig, strsignal(sig));
-		gui_err("hs_extraction_crashed=The high-speed extractor crashed (likely due to a corrupted file). The active slot wasn't changed, but the target slot is incomplete.");
+		HsFail(std::string("extractor crashed (") + strsignal(sig) + ")");
 		return HighSpeedResult::kAborted;
 	}
 
 	if (waited != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-		LOGERR("high-speed: extractor failed (wait=%d status=0x%x)\n", (int)waited, status);
-		gui_err(("hs_extraction_failed=High-speed extraction failed, or a checksum didn't match. The slot you booted from wasn't touched and the active slot wasn't changed, but slot " +
-			target_slot + " is now incomplete. You Can Either Flash Using Normal Method, Or Reboot To Previous System Normally.").c_str());
+		HsFail(last_error.empty() ? std::string("extractor exited with an error") : HsTrim(last_error));
 		return HighSpeedResult::kAborted;
 	}
 
@@ -1194,8 +1193,7 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	// didn't show. this is the last gate before the slot gets switched.
 	for (auto& kv : part_pct) {
 		if (kv.second < 100) {
-			LOGERR("high-speed: partition '%s' only reached %d%% before the extractor exited\n", kv.first.c_str(), kv.second);
-			gui_err(("hs_partition_incomplete=Partition '" + kv.first + "' wasn't fully extracted. The active slot wasn't changed; slot " + target_slot + " is incomplete.").c_str());
+			HsFail("'" + kv.first + "' stopped at " + std::to_string(kv.second) + "%");
 			return HighSpeedResult::kAborted;
 		}
 	}
@@ -1206,59 +1204,51 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 	// each claimed target once more from here, then a global sync, and only
 	// call it success if every flush went through. the claims are released
 	// right after, before anything else touches these partitions.
-	gui_print("High-speed flash: flushing writes to storage...\n");
+	HsSay("  Flushing to storage...");
 	for (size_t i = 0; i < target_fds.size(); i++) {
 		if (fsync(target_fds[i].get()) != 0) {
-			LOGERR("high-speed: couldn't flush '%s' (%s)\n", by_size[i]->name.c_str(), strerror(errno));
-			gui_err(("hs_flush_failed=Couldn't confirm that '" + by_size[i]->name +
-				"' was fully written to storage. The active slot wasn't changed; slot " + target_slot +
-				" should not be booted.").c_str());
+			HsFail("can't flush '" + by_size[i]->name + "' to storage (" + strerror(errno) + ")");
 			return HighSpeedResult::kAborted;
 		}
 	}
 	// firmware: one more read-back check while the claims are still held
 	{
-		std::string verified;
+		size_t verified_count = 0;
 		for (size_t i = 0; i < target_fds.size(); i++) {
 			if (!by_size[i]->is_firmware)
 				continue;
 			if (!VerifyDeviceSha256(target_fds[i].get(), by_size[i]->expanded_size, by_size[i]->sha256)) {
-				LOGERR("high-speed: firmware '%s' does not match its SHA-256 when read back from storage\n",
-					by_size[i]->name.c_str());
-				gui_err(("hs_firmware_verify_failed=Firmware '" + by_size[i]->name +
-					"' did not verify after writing. The active slot wasn't changed; slot " + target_slot +
-					" is incomplete, don't boot it.").c_str());
+				HsFail("firmware '" + by_size[i]->name + "' doesn't match its SHA-256 on storage");
 				return HighSpeedResult::kAborted;
 			}
-			verified += (verified.empty() ? "" : ", ") + by_size[i]->name;
+			verified_count++;
 		}
-		if (!verified.empty())
-			gui_print("High-speed flash: firmware verified from storage (%s).\n", verified.c_str());
+		if (verified_count)
+			HsSay("  Firmware verified: " + std::to_string(verified_count) + " images");
 	}
 	target_fds.clear();
 	sync();
 
 	time(&extract_stop);
 	int extract_secs = (int) difftime(extract_stop, extract_start);
-	gui_print("High-speed flash: slot %s written and flushed in %ds.\n", target_slot.c_str(), extract_secs);
+	HsSay("  Done in " + std::to_string(extract_secs) + "s");
 
 	// update_engine never ran, so nothing told the bootloader to switch
 	// slots -- that's the one piece of its job we still have to do
 	// ourselves, and only now that every partition has actually succeeded
 	PartitionManager.Set_Active_Slot(target_slot);
 	if (PartitionManager.Get_Active_Slot_Display() != target_slot) {
-		gui_err(("hs_slot_switch_failed=Every partition was written and flushed, but switching to slot " + target_slot +
-			" didn't take. Switch to it manually from the slot menu before rebooting.").c_str());
+		HsFail("all images written, but switching to slot " + target_slot + " failed");
 		return HighSpeedResult::kAborted;
 	}
 
 	if (android::base::GetBoolProperty("ro.virtual_ab.enabled", false)) {
 		PartitionManager.Unlock_Block_Partitions();
 		PartitionManager.Prepare_All_Super_Volumes();
-		gui_warn("mount_vab_partitions=Devices on super may not mount until after rebooting recovery.");
+		HsWarn("  Super devices may not mount until recovery is rebooted");
 	}
 
-	gui_print("1 min flash is cool right, it's done (^-^), now reboot to recovery again\n\n");
+	HsSay("  Active slot is now " + target_slot);
 	return HighSpeedResult::kSucceeded;
 }
 // ---------------------------------------------------------------------

@@ -2085,7 +2085,7 @@ void TWPartitionManager::Update_System_Details(void) {
   	bool reporter = false;
   	#endif
 
-  	if (DataManager::GetIntValue(FOX_RUN_SURVIVAL_BACKUP) != 1)
+	if (DataManager::GetIntValue(FOX_RUN_SURVIVAL_BACKUP) != 1 && !DataManager::GetIntValue("tw_quiet_details"))
 		gui_msg("update_part_details=Updating partition details...");
 	for (iter = Partitions.begin(); iter != Partitions.end(); iter++) {
 		(*iter)->Update_Size(reporter);
@@ -2146,7 +2146,7 @@ void TWPartitionManager::Update_System_Details(void) {
 			}
 		}
 	}
-  	if (DataManager::GetIntValue(FOX_RUN_SURVIVAL_BACKUP) != 1)
+	if (DataManager::GetIntValue(FOX_RUN_SURVIVAL_BACKUP) != 1 && !DataManager::GetIntValue("tw_quiet_details"))
 		gui_msg("update_part_details_done=...done");
 	DataManager::SetValue(TW_BACKUP_DATA_SIZE, data_size);
 	string current_storage_path = DataManager::GetCurrentStoragePath();
@@ -3490,8 +3490,8 @@ bool TWPartitionManager::Rebuild_Logical_Group_For_High_Speed_Flash(
 
 	auto snapshots = android::snapshot::SnapshotManager::NewForFirstStageMount();
 	if (snapshots && snapshots->GetUpdateState() != android::snapshot::UpdateState::None) {
-		LOGERR("Refusing to rebuild the logical group while a snapshot update is active\n");
-		gui_err("Logical partitions cannot be resized while an Android snapshot update is active.");
+		LOGINFO("Refusing to rebuild the logical group while a snapshot update is active\n");
+		gui_print_color("error", "  ERROR: Super layout: an Android snapshot update is active\n");
 		return false;
 	}
 
@@ -3500,8 +3500,8 @@ bool TWPartitionManager::Rebuild_Logical_Group_For_High_Speed_Flash(
 
 	auto builder = MetadataBuilder::New(super_device, metadata_slot);
 	if (!builder) {
-		LOGERR("Unable to read logical partition metadata from '%s'\n", super_device.c_str());
-		gui_err("Unable to read the Super partition metadata.");
+		LOGINFO("Unable to read logical partition metadata from '%s'\n", super_device.c_str());
+		gui_print_color("error", "  ERROR: Super layout: can't read the Super metadata\n");
 		return false;
 	}
 
@@ -3525,15 +3525,15 @@ bool TWPartitionManager::Rebuild_Logical_Group_For_High_Speed_Flash(
 		}
 	}
 	if (group_name.empty()) {
-		LOGERR("Couldn't find which group these partitions belong to\n");
-		gui_err("Unable to determine the Super partition group for this ROM.");
+		LOGINFO("Couldn't find which group these partitions belong to\n");
+		gui_print_color("error", "  ERROR: Super layout: can't tell which group these partitions belong to\n");
 		return false;
 	}
 
 	auto* group = builder->FindGroup(group_name);
 	if (!group) {
-		LOGERR("Group '%s' not found in metadata\n", group_name.c_str());
-		gui_err("Unable to read the Super partition group metadata.");
+		LOGINFO("Group '%s' not found in metadata\n", group_name.c_str());
+		gui_print_color("error", "  ERROR: Super layout: group not found in the Super metadata\n");
 		return false;
 	}
 	uint64_t group_max_size = group->maximum_size();
@@ -3543,9 +3543,9 @@ bool TWPartitionManager::Rebuild_Logical_Group_For_High_Speed_Flash(
 	if (!declared_group_name.empty() && declared_group_size > 0) {
 		const std::string declared_full_name = declared_group_name + slot_suffix;
 		if (group_name != declared_full_name) {
-			LOGERR("Payload declares group '%s' but the device's partitions are in group '%s' -- refusing to guess\n",
+			LOGINFO("Payload declares group '%s' but the device's partitions are in group '%s' -- refusing to guess\n",
 				declared_full_name.c_str(), group_name.c_str());
-			gui_err("The Super partition group on this device doesn't match the one this ROM declares. Nothing was changed.");
+			gui_print_color("error", "  ERROR: Super layout: the device's group doesn't match the one this ROM declares\n");
 			return false;
 		}
 		if (declared_group_size != group_max_size)
@@ -3565,8 +3565,8 @@ bool TWPartitionManager::Rebuild_Logical_Group_For_High_Speed_Flash(
 
 	builder->RemoveGroupAndPartitions(group_name);
 	if (!builder->AddGroup(group_name, group_max_size)) {
-		LOGERR("Unable to re-add group '%s'\n", group_name.c_str());
-		gui_err("Unable to rebuild the Super partition group.");
+		LOGINFO("Unable to re-add group '%s'\n", group_name.c_str());
+		gui_print_color("error", "  ERROR: Super layout: can't rebuild the group\n");
 		return false;
 	}
 
@@ -3574,9 +3574,9 @@ bool TWPartitionManager::Rebuild_Logical_Group_For_High_Speed_Flash(
 	for (auto& kv : partitions)
 		total_requested += kv.second;
 	if (total_requested > group_max_size) {
-		LOGERR("This ROM needs %llu bytes but the group only allows %llu\n",
+		LOGINFO("This ROM needs %llu bytes but the group only allows %llu\n",
 			(unsigned long long)total_requested, (unsigned long long)group_max_size);
-		gui_err("This ROM's partitions don't fit in the Super group even with a fresh layout -- it's genuinely too big for this device.");
+		gui_print_color("error", "  ERROR: Super layout: this ROM is too big for the Super group on this device\n");
 		return false;
 	}
 
@@ -3621,22 +3621,23 @@ bool TWPartitionManager::Rebuild_Logical_Group_For_High_Speed_Flash(
 		}
 		if (!dropped_any || !builder->AddGroup(group_name, group_max_size) ||
 		    !lay_out(&failed_name, &failed_size)) {
-			LOGERR("Unable to add/size partition '%s' at %llu bytes\n",
+			LOGINFO("Unable to add/size partition '%s' at %llu bytes\n",
 				failed_name.c_str(), (unsigned long long)failed_size);
-			gui_err(("Unable to lay out '" + failed_name + "' in the rebuilt Super group.").c_str());
+			gui_print_color("error", "  ERROR: Super layout: '%s' (%.2f GiB) doesn't fit in group '%s'\n", failed_name.c_str(),
+				(double)failed_size / (1ULL << 30), group_name.c_str());
 			return false;
 		}
-		gui_print("Not enough room beside the booted slot, so its partitions will be overwritten.\n");
+		gui_print_color("warning", "  Not enough room beside the booted slot: its Super partitions will be overwritten\n");
 	}
 
 	auto updated = builder->Export();
 	if (!updated) {
-		gui_err("Unable to prepare the rebuilt Super partition metadata.");
+		gui_print_color("error", "  ERROR: Super layout: can't prepare the rebuilt metadata\n");
 		return false;
 	}
 	if (!android::fs_mgr::UpdatePartitionTable(super_device, *updated, metadata_slot)) {
-		LOGERR("Failed to commit the rebuilt Super partition table\n");
-		gui_err("Unable to write the rebuilt Super partition metadata.");
+		LOGINFO("Failed to commit the rebuilt Super partition table\n");
+		gui_print_color("error", "  ERROR: Super layout: can't write the rebuilt metadata\n");
 		return false;
 	}
 
@@ -3651,8 +3652,8 @@ bool TWPartitionManager::Rebuild_Logical_Group_For_High_Speed_Flash(
 		};
 		std::string mapped_path;
 		if (!android::fs_mgr::CreateLogicalPartition(params, &mapped_path)) {
-			LOGERR("Unable to map '%s' after rebuild\n", pname.c_str());
-			gui_err(("Unable to map '" + kv.first + "' after rebuilding the Super group.").c_str());
+			LOGINFO("Unable to map '%s' after rebuild\n", pname.c_str());
+			gui_print_color("error", "  ERROR: Super layout: can't map '%s' after the rebuild\n", kv.first.c_str());
 			return false;
 		}
 		if (mapped_paths)
