@@ -46,6 +46,7 @@
 #include <sys/statvfs.h>
 #include <sys/ioctl.h>
 #include <sys/sysmacros.h>
+#include <openssl/sha.h>
 #include <linux/fs.h>
 #include <dirent.h>
 #include <algorithm>
@@ -358,6 +359,7 @@ struct HighSpeedPartitionPlan {
 	uint64_t expanded_size = 0; // decompressed size, straight from the manifest
 	bool is_logical = false;   // true if this one lives in Super (needs the group rebuild)
 	bool is_firmware = false;  // physical, not boot chain
+	std::string sha256;        // SHA-256 from the manifest, raw bytes
 };
 
 // the dynamic-partition group the payload's manifest puts the logical
@@ -448,6 +450,33 @@ bool VerifyFirmwareNode(const std::string& node, const std::string& expected_par
 		return false;
 	}
 	return true;
+}
+
+// re-reads the first `size` bytes of the device from storage (cache
+// dropped) and compares the SHA-256 with the manifest. separate from the
+// extractor's own check on purpose.
+bool VerifyDeviceSha256(int fd, uint64_t size, const std::string& expected) {
+	if (expected.size() != SHA256_DIGEST_LENGTH || size == 0)
+		return false;
+	if (ioctl(fd, BLKFLSBUF, 0) != 0)
+		return false;
+	SHA256_CTX ctx;
+	SHA256_Init(&ctx);
+	std::vector<uint8_t> buf(4 << 20);
+	uint64_t offset = 0;
+	while (offset < size) {
+		size_t want = (size_t)std::min<uint64_t>(buf.size(), size - offset);
+		ssize_t got = pread(fd, buf.data(), want, offset);
+		if (got < 0 && errno == EINTR)
+			continue;
+		if (got <= 0)
+			return false;
+		SHA256_Update(&ctx, buf.data(), (size_t)got);
+		offset += (uint64_t)got;
+	}
+	uint8_t digest[SHA256_DIGEST_LENGTH];
+	SHA256_Final(digest, &ctx);
+	return memcmp(digest, expected.data(), sizeof(digest)) == 0;
 }
 
 // works out the exact node a physical (boot/dtbo/vbmeta...) partition
@@ -691,6 +720,7 @@ bool ProbeHighSpeedPayload(const std::string& package_path, ZipArchiveHandle zip
 
 		entry.target_path = "/" + name;
 		entry.expanded_size = part.new_partition_info().size();
+		entry.sha256 = part.new_partition_info().hash();
 		plan->push_back(std::move(entry));
 	}
 
@@ -1185,6 +1215,25 @@ HighSpeedResult TryHighSpeedAbInstall(const std::string& package, ZipArchiveHand
 				" should not be booted.").c_str());
 			return HighSpeedResult::kAborted;
 		}
+	}
+	// firmware: one more read-back check while the claims are still held
+	{
+		std::string verified;
+		for (size_t i = 0; i < target_fds.size(); i++) {
+			if (!by_size[i]->is_firmware)
+				continue;
+			if (!VerifyDeviceSha256(target_fds[i].get(), by_size[i]->expanded_size, by_size[i]->sha256)) {
+				LOGERR("high-speed: firmware '%s' does not match its SHA-256 when read back from storage\n",
+					by_size[i]->name.c_str());
+				gui_err(("hs_firmware_verify_failed=Firmware '" + by_size[i]->name +
+					"' did not verify after writing. The active slot wasn't changed; slot " + target_slot +
+					" is incomplete, don't boot it.").c_str());
+				return HighSpeedResult::kAborted;
+			}
+			verified += (verified.empty() ? "" : ", ") + by_size[i]->name;
+		}
+		if (!verified.empty())
+			gui_print("High-speed flash: firmware verified from storage (%s).\n", verified.c_str());
 	}
 	target_fds.clear();
 	sync();
